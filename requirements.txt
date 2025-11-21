@@ -1,5 +1,5 @@
 flask
 requests
 gunicorn
-deep-translator
 flask-cors
+google-generativeai
