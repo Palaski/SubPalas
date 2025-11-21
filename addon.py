@@ -4,7 +4,8 @@ import threading
 import time
 import requests
 import re
-import subprocess  # <--- ADICIONADO: Faltava esta importação
+import subprocess
+import shutil
 from flask import Flask, jsonify, request, send_from_directory, Response, make_response
 from flask_cors import CORS
 
@@ -26,9 +27,9 @@ USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
 
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.5",  # Incrementei a versão para forçar update no Stremio se necessário
-    "name": "AutoSync PT-BR (Instant)",
-    "description": "Legendas PT-BR sincronizadas. Selecione, aguarde o aviso de 'Sincronizando' sumir e aproveite.",
+    "version": "0.0.6",
+    "name": "AutoSync PT-BR (Triple Ref)",
+    "description": "3 Versões: WEB (v1), HDTV (v2) e BluRay (v3). Teste as opções se houver drift.",
     "types": ["movie", "series"],
     "resources": ["subtitles"],
     "idPrefixes": ["tt"]
@@ -50,19 +51,19 @@ def cleanup_temp(files):
             except:
                 pass
 
-def generate_loading_srt():
-    """Gera um SRT válido avisando o usuário para esperar."""
+def generate_loading_srt(variant_name):
+    """Gera um SRT de aviso."""
     srt_content = (
         "1\n"
         "00:00:00,000 --> 00:00:10,000\n"
-        "Sincronizando legenda... Aguarde...\n\n"
+        f"Sincronizando ({variant_name})... Aguarde...\n\n"
         "2\n"
         "00:00:10,500 --> 00:00:20,000\n"
-        "Se esta mensagem persistir,\nselecione 'None' e depois 'AutoSync' novamente.\n"
+        "Se esta mensagem persistir por >30s,\nselecione outra versão na lista.\n"
     )
     return srt_content
 
-# --- OpenSubtitles e Download ---
+# --- OpenSubtitles ---
 
 def get_download_link(file_id, headers):
     try:
@@ -73,46 +74,55 @@ def get_download_link(file_id, headers):
         return None
 
 def search_references_opensubtitles(imdb_id, season=None, episode=None):
-    if not OS_API_KEY: return []
+    """
+    Busca 3 referências distintas: WEB, HDTV e BLURAY.
+    """
+    if not OS_API_KEY: return {}
     
     headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     try: clean_id = int(imdb_id.replace("tt", ""))
-    except: return []
+    except: return {}
 
     params = {"imdb_id": clean_id, "languages": "en", "order_by": "download_count", "order_direction": "desc"}
     if season: params.update({"season_number": season, "episode_number": episode})
 
-    references = []
+    references = {} # Usar dict para garantir unicidade de tipo: {'WEB': url, 'HDTV': url, 'BLURAY': url}
+    
     try:
-        res = requests.get("https://api.opensubtitles.com/api/v1/subtitles", headers=headers, params=params, timeout=10)
+        # Busca mais resultados para ter chance de achar BluRay
+        res = requests.get("https://api.opensubtitles.com/api/v1/subtitles", headers=headers, params=params, timeout=12)
         data = res.json()
         
         if data.get('total_count', 0) > 0:
             results = data['data']
-            found_web, found_other = False, False
             
-            # Prioriza encontrar 1 WEB e 1 HDTV
             for item in results:
-                if len(references) >= 2: break
+                # Se já preenchemos os 3 slots, para.
+                if len(references) >= 3: break
+                
                 f = item['attributes']['files'][0]
                 fname = f['file_name'].lower()
-                is_web = any(x in fname for x in ['web', 'amzn', 'nf', 'hulu'])
+                file_id = f['file_id']
                 
-                link = get_download_link(f['file_id'], headers)
-                if not link: continue
-
-                if is_web and not found_web:
-                    references.append({'url': link, 'type': 'WEB'})
-                    found_web = True
-                elif not is_web and not found_other:
-                    references.append({'url': link, 'type': 'HDTV'})
-                    found_other = True
+                # Classificação por Nome
+                rtype = None
+                if any(x in fname for x in ['web', 'amzn', 'nf', 'hulu', 'netflix', 'disney']):
+                    rtype = 'WEB'
+                elif any(x in fname for x in ['bluray', 'bdrip', 'brrip', 'blue', 'bdr']):
+                    rtype = 'BLURAY'
+                elif any(x in fname for x in ['hdtv', 'tv', 'pdtv', 'dsr']):
+                    rtype = 'HDTV'
+                
+                # Se achou um tipo e ainda não temos esse tipo salvo
+                if rtype and rtype not in references:
+                    link = get_download_link(file_id, headers)
+                    if link: references[rtype] = link
             
-            # Fallback se não achou tipos específicos
+            # Fallback: Se faltou algum slot, preenche com o top download genérico (se não for repetido)
             if not references and len(results) > 0:
                  link = get_download_link(results[0]['attributes']['files'][0]['file_id'], headers)
-                 if link: references.append({'url': link, 'type': 'Default'})
-                 
+                 if link: references['DEFAULT'] = link
+
     except Exception as e:
         logger.error(f"Erro busca EN: {e}")
     
@@ -147,45 +157,49 @@ def download_file(url, dest_path):
 # --- Core Logic ---
 
 def run_sync_thread(imdb_id, season, episode, cache_key):
-    """Thread que baixa e processa as legendas V1 e V2"""
-    v1_path = os.path.join(CACHE_DIR, f"{cache_key}_v1.srt")
-    
-    # Se V1 já existe, assumimos que já foi processado (evita trabalho duplo)
-    if os.path.exists(v1_path):
-        return
+    v1_marker = os.path.join(CACHE_DIR, f"{cache_key}_v1.srt")
+    if os.path.exists(v1_marker): return
 
-    logger.info(f"Processando {cache_key}...")
+    logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
     
-    # 1. Baixar PT-BR
+    # 1. Baixar PT-BR (Target)
     url_pt = search_best_ptbr(imdb_id, season, episode)
-    if not url_pt:
-        logger.error("PT-BR nao achado")
-        return 
-        
+    if not url_pt: return 
     path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
     if not download_file(url_pt, path_pt): return
 
     # 2. Baixar Referencias EN
-    refs = search_references_opensubtitles(imdb_id, season, episode)
-    
+    refs_dict = search_references_opensubtitles(imdb_id, season, episode)
     files_clean = [path_pt]
 
-    # 3. Sincronizar
-    # Se não achou nenhuma ref, copiamos a PT original como V1 só pra não falhar
-    if not refs:
-        import shutil
-        shutil.copy(path_pt, v1_path)
+    # Se não achou NADA, copia o original para V1 para não quebrar
+    if not refs_dict:
+        shutil.copy(path_pt, v1_marker)
+        return
+
+    # Mapeamento fixo para garantir ordem no Stremio: v1=WEB, v2=HDTV, v3=BLURAY
+    # Se não tiver algum, usamos o que tiver disponível
     
-    for i, ref in enumerate(refs):
-        # v1 é a principal, v2 é a alternativa
-        version_label = f"v{i+1}" 
+    # Ordem de prioridade para preencher os slots v1, v2, v3
+    priority_order = ['WEB', 'HDTV', 'BLURAY', 'DEFAULT']
+    
+    # Cria uma lista ordenada das URLs que encontramos
+    final_refs = []
+    for p in priority_order:
+        if p in refs_dict:
+            final_refs.append((p, refs_dict[p]))
+    
+    # Processa cada referência encontrada
+    for i, (rtype, url) in enumerate(final_refs):
+        version_label = f"v{i+1}" # v1, v2, v3...
         final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
-        path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{i}.srt")
+        path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{rtype}.srt")
         files_clean.append(path_ref)
 
-        if download_file(ref['url'], path_ref):
+        if download_file(url, path_ref):
+            # Truque: --max-offset-seconds ajuda se o drift for bizarro (comum em extended cuts)
             cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", final_path, "--encoding", "utf-8"]
-            logger.info(f"Syncing {version_label}...")
+            logger.info(f"Syncing {version_label} ({rtype})...")
             try:
                 subprocess.run(cmd, capture_output=True, check=True)
             except Exception as e:
@@ -198,7 +212,7 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
 
 @app.route('/')
 def index():
-    return "AutoSync Instant is Running"
+    return "AutoSync Triple Ref Running"
 
 @app.route('/manifest.json')
 def manifest():
@@ -213,11 +227,14 @@ def subtitles(type, id, extra):
     
     cache_key = get_file_hash(imdb_id, season, episode)
     
-    # Dispara a thread SEMPRE que solicitado (se ja existir, a thread aborta cedo)
     threading.Thread(target=run_sync_thread, args=(imdb_id, season, episode, cache_key)).start()
 
     host = request.host_url.rstrip('/')
     
+    # Retorna 3 Opções fixas. Se o servidor não achar uma delas (ex: não achou BluRay),
+    # a rota de download vai ficar no 'Loading' eternamente até dar timeout.
+    # Idealmente, só retornariamos o que existe, mas para 'Resposta Instantanea', 
+    # retornamos as slots e deixamos o usuario testar.
     return jsonify({
         "subtitles": [
             {
@@ -231,31 +248,33 @@ def subtitles(type, id, extra):
                 "url": f"{host}/static_subs/{cache_key}_v2.srt",
                 "lang": "pob",
                 "format": "srt"
+            },
+            {
+                "id": f"as_v3_{cache_key}",
+                "url": f"{host}/static_subs/{cache_key}_v3.srt",
+                "lang": "pob",
+                "format": "srt"
             }
         ]
     })
 
 @app.route('/static_subs/<filename>')
 def serve_subs(filename):
-    """
-    Tenta servir o arquivo. Se não existir, espera até 15s.
-    Se ainda não existir, retorna legenda de 'Loading'.
-    """
     file_path = os.path.join(CACHE_DIR, filename)
     
-    # Loop de espera (Polling)
-    max_retries = 15 # 15 segundos
+    # Identifica qual versão é para a mensagem de erro
+    variant = "WEB-DL" if "_v1" in filename else "HDTV" if "_v2" in filename else "BluRay"
+
+    max_retries = 20 # Aumentei para 20s pois agora busca 3 legendas
     for _ in range(max_retries):
         if os.path.exists(file_path):
-            # Arquivo pronto!
             response = make_response(send_from_directory(CACHE_DIR, filename))
             response.headers['Cache-Control'] = 'public, max-age=31536000'
             return response
         time.sleep(1)
     
-    # Timeout: Retorna legenda de Loading
-    logger.info(f"Timeout servindo {filename}, enviando loading...")
-    response = make_response(generate_loading_srt())
+    logger.info(f"Timeout servindo {filename}")
+    response = make_response(generate_loading_srt(variant))
     response.headers['Content-Type'] = 'application/x-subrip'
     response.headers['Content-Disposition'] = f'inline; filename="{filename}"'
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
