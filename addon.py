@@ -26,8 +26,9 @@ CACHE_DIR = os.path.join(os.getcwd(), "subtitle_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 OS_API_KEY = os.getenv("OS_API_KEY", "")
-TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# use env para trocar modelo sem editar código
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash").strip()
 USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync/1.0")
 PORT = int(os.environ.get("PORT", 7000))
 
@@ -36,9 +37,9 @@ if GEMINI_API_KEY:
 
 MANIFEST = {
     "id": "community.autotranslate.ai",
-    "version": "0.3.3",
+    "version": "0.3.4",
     "name": "AutoSync AI (Gemini)",
-    "description": "Tradução de alta qualidade via Google Gemini + Busca inteligente de release.",
+    "description": "Tradução PT-BR via Gemini + busca inteligente de release (sem proxy de vídeo).",
     "types": ["movie", "series"],
     "resources": ["subtitles"],
     "idPrefixes": ["tt"],
@@ -65,11 +66,9 @@ def get_file_hash(imdb_id, season=None, episode=None, video_hash=None):
     return base
 
 def clean_filename(name: str) -> str:
-    """Normaliza nome do arquivo para ajudar no match."""
     return name.replace('.', ' ').replace('-', ' ').lower()
 
 def wrap_text(s: str, width: int = 44) -> str:
-    """Quebra linhas longas para TVs mais exigentes (opcional)."""
     words = s.split()
     if not words:
         return s
@@ -84,56 +83,103 @@ def wrap_text(s: str, width: int = 44) -> str:
         lines.append(cur)
     return "\n".join(lines)
 
+def sanitize_input_lines(lines):
+    # evita quebras internas e caracteres estranhos bagunçando JSON
+    out = []
+    for t in lines:
+        t = (t or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+        out.append(t)
+    return out
+
 # -----------------------------------------------------------------------------
-# LLM Translation (Gemini)
+# JSON Parser robusto para a saída do modelo
+# -----------------------------------------------------------------------------
+def _parse_json_array_strict(s: str, expected_len: int | None = None):
+    try:
+        # remove blocos de markdown se vierem
+        if "```" in s:
+            s = re.sub(r"```(?:json)?", "", s).strip()
+
+        # corta lixo fora do primeiro array
+        if "[" in s and "]" in s:
+            s = "[" + s.split("[", 1)[-1].rsplit("]", 1)[0] + "]"
+
+        # normaliza aspas “curly”
+        s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
+
+        # remove vírgula antes de fechar array
+        s = re.sub(r",\s*\]", "]", s)
+
+        data = json.loads(s)
+        if isinstance(data, list):
+            # força string
+            data = [str(x).replace("\r\n", "\n").replace("\r", "\n") for x in data]
+            if expected_len is None or len(data) == expected_len:
+                return data
+    except Exception:
+        pass
+
+    # último recurso: tentar split manual
+    try:
+        inner = s.strip()
+        if inner.startswith("[") and inner.endswith("]"):
+            inner = inner[1:-1]
+        parts = re.split(r'"\s*,\s*"', inner)
+        parts = [p.strip().strip('"') for p in parts if p.strip()]
+        if expected_len is None or len(parts) == expected_len:
+            return parts
+    except Exception:
+        pass
+
+    raise ValueError("invalid json array from model")
+
+# -----------------------------------------------------------------------------
+# LLM Translation (Gemini) com JSON estrito + retry
 # -----------------------------------------------------------------------------
 def translate_batch_gemini(texts):
-    """
-    Usa Gemini Flash para traduzir uma lista de falas.
-    Retorna lista traduzida ou None se falhar.
-    """
     if not GEMINI_API_KEY:
         return None
 
-    model = genai.GenerativeModel("models/gemini-2.5-flash")
-
-    prompt = (
-        "Você é um tradutor profissional de legendas (EN -> PT-BR). "
-        "Traduza a lista de falas JSON abaixo para Português do Brasil. "
-        "Regras: 1) Mantenha gírias e tom natural; 2) Seja conciso (limite de caracteres para TV); "
-        "3) Retorne APENAS um array JSON de strings, ex: [\"Olá\", \"Tudo bem?\"]; "
-        "4) Não inclua explicações, cabeçalhos ou markdown.\n\n"
-        f"Input: {json.dumps(texts, ensure_ascii=False)}"
-    )
+    # sanitiza entradas
+    texts = sanitize_input_lines(texts)
 
     try:
-        response = model.generate_content(prompt)
-        text_resp = (response.text or "").strip()
-
-        # pode vir com ```json ... ```
-        if "```" in text_resp:
-            if "```json" in text_resp:
-                text_resp = text_resp.split("```json", 1)[-1].split("```", 1)[0].strip()
-            else:
-                text_resp = text_resp.split("```", 1)[-1].split("```", 1)[0].strip()
-
-        # se por algum motivo vier com texto extra, tenta isolar o array
-        if not text_resp.strip().startswith("["):
-            if "[" in text_resp and "]" in text_resp:
-                text_resp = "[" + text_resp.split("[", 1)[-1].rsplit("]", 1)[0] + "]"
-
-        translated = json.loads(text_resp)
-
-        if isinstance(translated, list) and len(translated) == len(texts):
-            return translated
-        logger.warning("Gemini: tamanho do array não bate ou formato inesperado.")
-        return None
+        model = genai.GenerativeModel(
+            model_name=GEMINI_MODEL,
+            generation_config={
+                "response_mime_type": "application/json",
+                "response_schema": { "type": "array", "items": { "type": "string" } },
+                "temperature": 0.2,
+            },
+            system_instruction=(
+                "Você é um tradutor de legendas EN->PT-BR. "
+                "Retorne APENAS um array JSON de strings (um item por fala), sem markdown."
+            ),
+        )
     except Exception as e:
-        logger.error(f"Gemini Error: {e}")
+        logger.error(f"Gemini init error: {e}")
         return None
+
+    prompt = (
+        "Traduza cada fala do array abaixo para PT-BR, mantendo a ordem e o total de itens. "
+        "Responda somente com um array JSON de strings.\n\n"
+        f"{json.dumps(texts, ensure_ascii=False)}"
+    )
+
+    # retry leve (2 tentativas)
+    for attempt in range(2):
+        try:
+            resp = model.generate_content(prompt)
+            raw = (resp.text or "").strip()
+            return _parse_json_array_strict(raw, expected_len=len(texts))
+        except Exception as e:
+            logger.error(f"Gemini Error (attempt {attempt+1}/2): {e}")
+            time.sleep(0.7)
+
+    return None
 
 # -----------------------------------------------------------------------------
-# OpenSubtitles (URLs corrigidas)
+# OpenSubtitles (URLs corretas)
 # -----------------------------------------------------------------------------
 def get_download_link(file_id, headers):
     try:
@@ -250,7 +296,7 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
         return
 
     try:
-        r = session.get(url_en, timeout=15)
+        r = session.get(url_en, timeout=20)
         r.raise_for_status()
         r.encoding = r.apparent_encoding or "utf-8"
         content = r.text.replace("\r\n", "\n")
@@ -272,10 +318,10 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
     # Sinalização de método
     final_srt_content = []
     final_srt_content.append(
-        f"0\n00:00:01,000 --> 00:00:05,000\n[AI Sync: {method}]\n"
+        f"0\n00:00:01,000 --> 00:00:05,000\n[AI Sync: {method} | Model: {GEMINI_MODEL}]\n"
     )
 
-    batch_size = 18  # um pouco mais conservador
+    batch_size = 12  # menor batch reduz erros de JSON longo
     for i in range(0, len(subs), batch_size):
         chunk = subs[i:i + batch_size]
         texts_en = [s["text"] for s in chunk]
@@ -287,12 +333,10 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
 
         for idx, sub in enumerate(chunk):
             line_pt = texts_pt[idx] if idx < len(texts_pt) else sub["text"]
-            # opcional: wrap para TVs
             line_pt = wrap_text(line_pt, width=44)
             final_srt_content.append(f"{sub['head']}\n{line_pt}\n")
 
-        # respeitar limites do tier free
-        time.sleep(1.5)
+        time.sleep(1.2)  # respeitar limites
 
     try:
         with open(final_path, "w", encoding="utf-8") as f:
@@ -326,11 +370,12 @@ def subtitles(type, id, extra):
 
     try:
         # extra vem url-encoded (videoHash=...&filename=...)
-        q = parse_qs(extra.replace(".json", ""), keep_blank_values=True)
+        cleaned = extra.replace(".json", "")
+        q = parse_qs(cleaned, keep_blank_values=True)
         if "videoHash" in q and q["videoHash"]:
             video_hash = q["videoHash"][0]
         if "filename" in q and q["filename"]:
-            filename_hint = q["filename"][0]  # manter url-encoded para heurística leve
+            filename_hint = q["filename"][0]  # mantemos encoded; heurística trata
     except Exception as e:
         logger.warning(f"extra parse error: {e}")
 
@@ -374,5 +419,3 @@ def serve_subs(filename):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
-
-
