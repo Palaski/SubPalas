@@ -31,7 +31,7 @@ if GEMINI_API_KEY:
 
 MANIFEST = {
     "id": "community.autotranslate.ai",
-    "version": "0.3.1",
+    "version": "0.3.2",
     "name": "AutoSync AI (Gemini)",
     "description": "Tradução de alta qualidade via Google Gemini + Busca inteligente de release.",
     "types": ["movie", "series"],
@@ -98,7 +98,7 @@ def translate_batch_gemini(texts):
 
 def get_download_link(file_id, headers):
     try:
-        # CORRIGIDO: URL Limpa sem markdown
+        # URL corrigida (removido markdown)
         res = requests.post("[https://api.opensubtitles.com/api/v1/download](https://api.opensubtitles.com/api/v1/download)", headers=headers, json={"file_id": file_id})
         return res.json().get('link')
     except: return None
@@ -119,7 +119,7 @@ def search_english_sub(imdb_id, season=None, episode=None, video_hash=None, file
     if video_hash:
         logger.info(f"--> Buscando HASH: {video_hash}")
         try:
-            # CORRIGIDO: URL Limpa sem markdown
+            # URL corrigida (removido markdown)
             res = requests.get("[https://api.opensubtitles.com/api/v1/subtitles](https://api.opensubtitles.com/api/v1/subtitles)", headers=headers, params={"moviehash": video_hash, "languages": "en"}, timeout=10)
             data = res.json()
             if data.get('total_count', 0) > 0:
@@ -132,7 +132,7 @@ def search_english_sub(imdb_id, season=None, episode=None, video_hash=None, file
     if season: params.update({"season_number": season, "episode_number": episode})
     
     try:
-        # CORRIGIDO: URL Limpa sem markdown
+        # URL corrigida (removido markdown)
         res = requests.get("[https://api.opensubtitles.com/api/v1/subtitles](https://api.opensubtitles.com/api/v1/subtitles)", headers=headers, params=params, timeout=10)
         data = res.json()
         
@@ -231,7 +231,7 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
 # --- Rotas ---
 
 @app.route('/')
-def index(): return "AutoSync AI v0.3.1"
+def index(): return "AutoSync AI v0.3.2"
 
 @app.route('/manifest.json')
 def manifest(): return jsonify(MANIFEST)
