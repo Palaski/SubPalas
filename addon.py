@@ -4,6 +4,7 @@ import threading
 import time
 import requests
 import re
+import subprocess  # <--- ADICIONADO: Faltava esta importação
 from flask import Flask, jsonify, request, send_from_directory, Response, make_response
 from flask_cors import CORS
 
@@ -25,7 +26,7 @@ USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
 
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.4",
+    "version": "0.0.5",  # Incrementei a versão para forçar update no Stremio se necessário
     "name": "AutoSync PT-BR (Instant)",
     "description": "Legendas PT-BR sincronizadas. Selecione, aguarde o aviso de 'Sincronizando' sumir e aproveite.",
     "types": ["movie", "series"],
@@ -159,7 +160,7 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
     url_pt = search_best_ptbr(imdb_id, season, episode)
     if not url_pt:
         logger.error("PT-BR nao achado")
-        return # Cria arquivo de erro?
+        return 
         
     path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
     if not download_file(url_pt, path_pt): return
@@ -185,7 +186,10 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         if download_file(ref['url'], path_ref):
             cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", final_path, "--encoding", "utf-8"]
             logger.info(f"Syncing {version_label}...")
-            subprocess.run(cmd, capture_output=True)
+            try:
+                subprocess.run(cmd, capture_output=True, check=True)
+            except Exception as e:
+                logger.error(f"Erro ao rodar ffsubsync: {e}")
     
     cleanup_temp(files_clean)
     logger.info(f"Concluido {cache_key}")
@@ -210,13 +214,10 @@ def subtitles(type, id, extra):
     cache_key = get_file_hash(imdb_id, season, episode)
     
     # Dispara a thread SEMPRE que solicitado (se ja existir, a thread aborta cedo)
-    # Isso garante que se o cache foi limpo, recria.
     threading.Thread(target=run_sync_thread, args=(imdb_id, season, episode, cache_key)).start()
 
     host = request.host_url.rstrip('/')
     
-    # Retorna IMEDIATAMENTE as duas opcoes. 
-    # O Stremio vai mostrar na lista. O 'loading' acontece no download do arquivo.
     return jsonify({
         "subtitles": [
             {
@@ -248,7 +249,6 @@ def serve_subs(filename):
         if os.path.exists(file_path):
             # Arquivo pronto!
             response = make_response(send_from_directory(CACHE_DIR, filename))
-            # Cache de 1 ano para arquivos prontos
             response.headers['Cache-Control'] = 'public, max-age=31536000'
             return response
         time.sleep(1)
@@ -258,7 +258,6 @@ def serve_subs(filename):
     response = make_response(generate_loading_srt())
     response.headers['Content-Type'] = 'application/x-subrip'
     response.headers['Content-Disposition'] = f'inline; filename="{filename}"'
-    # IMPORTANTE: Não fazer cache do Loading, para o Stremio tentar baixar de novo se o usuario mudar e voltar
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     return response
 
