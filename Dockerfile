@@ -1,9 +1,11 @@
 FROM python:3.9-slim
 
-# 1. Instalar dependências do sistema (FFmpeg é obrigatório para a mágica acontecer)
-# O 'git' e outros utilitários ajudam a evitar erros em algumas libs
+# 1. Instalar dependências do sistema
+# 'ffmpeg' é para processamento de mídia
+# 'git' é utilitário
+# 'build-essential' e 'python3-dev' trazem o GCC necessário para compilar o webrtcvad/ffsubsync
 RUN apt-get update && \
-    apt-get install -y ffmpeg git && \
+    apt-get install -y ffmpeg git build-essential python3-dev && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
