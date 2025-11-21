@@ -27,7 +27,6 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 OS_API_KEY = os.getenv("OS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-# use env para trocar modelo sem editar código
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash").strip()
 USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync/1.0")
 PORT = int(os.environ.get("PORT", 7000))
@@ -37,9 +36,9 @@ if GEMINI_API_KEY:
 
 MANIFEST = {
     "id": "community.autotranslate.ai",
-    "version": "0.3.4",
+    "version": "0.4.0",
     "name": "AutoSync AI (Gemini)",
-    "description": "Tradução PT-BR via Gemini + busca inteligente de release (sem proxy de vídeo).",
+    "description": "Tradução PT-BR via Gemini (one-shot) + busca inteligente de release (sem proxy de vídeo).",
     "types": ["movie", "series"],
     "resources": ["subtitles"],
     "idPrefixes": ["tt"],
@@ -84,7 +83,6 @@ def wrap_text(s: str, width: int = 44) -> str:
     return "\n".join(lines)
 
 def sanitize_input_lines(lines):
-    # evita quebras internas e caracteres estranhos bagunçando JSON
     out = []
     for t in lines:
         t = (t or "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
@@ -92,34 +90,23 @@ def sanitize_input_lines(lines):
     return out
 
 # -----------------------------------------------------------------------------
-# JSON Parser robusto para a saída do modelo
+# JSON Parser robusto (para saída em array quando usar batch)
 # -----------------------------------------------------------------------------
 def _parse_json_array_strict(s: str, expected_len: int | None = None):
     try:
-        # remove blocos de markdown se vierem
         if "```" in s:
             s = re.sub(r"```(?:json)?", "", s).strip()
-
-        # corta lixo fora do primeiro array
         if "[" in s and "]" in s:
             s = "[" + s.split("[", 1)[-1].rsplit("]", 1)[0] + "]"
-
-        # normaliza aspas “curly”
         s = s.replace("“", "\"").replace("”", "\"").replace("’", "'")
-
-        # remove vírgula antes de fechar array
         s = re.sub(r",\s*\]", "]", s)
-
         data = json.loads(s)
         if isinstance(data, list):
-            # força string
             data = [str(x).replace("\r\n", "\n").replace("\r", "\n") for x in data]
             if expected_len is None or len(data) == expected_len:
                 return data
     except Exception:
         pass
-
-    # último recurso: tentar split manual
     try:
         inner = s.strip()
         if inner.startswith("[") and inner.endswith("]"):
@@ -130,17 +117,15 @@ def _parse_json_array_strict(s: str, expected_len: int | None = None):
             return parts
     except Exception:
         pass
-
     raise ValueError("invalid json array from model")
 
 # -----------------------------------------------------------------------------
-# LLM Translation (Gemini) com JSON estrito + retry
+# LLM Translation (Gemini) - BATCH (fallback)
 # -----------------------------------------------------------------------------
 def translate_batch_gemini(texts):
     if not GEMINI_API_KEY:
         return None
 
-    # sanitiza entradas
     texts = sanitize_input_lines(texts)
 
     try:
@@ -166,7 +151,6 @@ def translate_batch_gemini(texts):
         f"{json.dumps(texts, ensure_ascii=False)}"
     )
 
-    # retry leve (2 tentativas)
     for attempt in range(2):
         try:
             resp = model.generate_content(prompt)
@@ -174,8 +158,68 @@ def translate_batch_gemini(texts):
             return _parse_json_array_strict(raw, expected_len=len(texts))
         except Exception as e:
             logger.error(f"Gemini Error (attempt {attempt+1}/2): {e}")
-            time.sleep(0.7)
+            time.sleep(0.8)
+    return None
 
+# -----------------------------------------------------------------------------
+# LLM Translation (Gemini) - ONE SHOT (preferido)
+# -----------------------------------------------------------------------------
+def _one_shot_try(model_name: str, srt_text: str) -> str | None:
+    try:
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            generation_config={
+                "response_mime_type": "text/plain",
+                "temperature": 0.2,
+            },
+            system_instruction=(
+                "Você é um tradutor profissional de legendas EN->PT-BR. "
+                "Receberá um arquivo SRT completo e deve devolver o MESMO SRT, "
+                "preservando integralmente: numeração, timestamps e quebras de bloco. "
+                "Traduza APENAS o texto das falas para PT-BR, conciso e natural. "
+                "NÃO adicione comentários, cabeçalhos ou markdown."
+            ),
+        )
+        prompt = (
+            "Traduza para PT-BR mantendo a estrutura SRT idêntica (numeração e timestamps iguais). "
+            "Responda com SRT puro:\n\n"
+            f"{srt_text}"
+        )
+        resp = model.generate_content(prompt)
+        out = (resp.text or "").strip()
+        # validação leve: deve conter algum timestamp SRT
+        if re.search(r"\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}", out):
+            return out
+        return out or None
+    except Exception as e:
+        msg = str(e)
+        logger.error(f"Gemini one-shot error [{model_name}]: {msg}")
+        # backoff amigável se o erro sugeriu retry
+        m = re.search(r"retry in\s+(\d+)\s*s", msg.lower())
+        if m:
+            wait_s = min(int(m.group(1)), 35)
+            time.sleep(wait_s)
+        else:
+            time.sleep(1.5)
+        return None
+
+def translate_srt_one_shot(srt_text: str) -> str | None:
+    if not GEMINI_API_KEY:
+        return None
+    srt_clean = srt_text.replace("\r\n", "\n").strip()
+
+    # tenta modelo principal e 2 alternativos (menos disputados)
+    candidates = [
+        GEMINI_MODEL,
+        "models/gemini-flash-latest",
+        "models/gemini-2.0-flash-lite",
+    ]
+    for mid in candidates:
+        out = _one_shot_try(mid, srt_clean)
+        if out:
+            if mid != GEMINI_MODEL:
+                logger.info(f"Gemini one-shot: usou modelo alternativo {mid}")
+            return out
     return None
 
 # -----------------------------------------------------------------------------
@@ -296,7 +340,7 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
         return
 
     try:
-        r = session.get(url_en, timeout=20)
+        r = session.get(url_en, timeout=25)
         r.raise_for_status()
         r.encoding = r.apparent_encoding or "utf-8"
         content = r.text.replace("\r\n", "\n")
@@ -304,7 +348,23 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
         logger.error(f"Download EN error: {e}")
         return
 
-    # Parse SRT
+    # ------- TENTATIVA 1: one-shot (1 request por episódio) -------
+    srt_pt = translate_srt_one_shot(content)
+    if srt_pt:
+        banner = (
+            f"0\n00:00:01,000 --> 00:00:05,000\n"
+            f"[AI Sync: {method} | Model: {GEMINI_MODEL} | mode=one-shot]\n\n"
+        )
+        try:
+            with open(final_path, "w", encoding="utf-8") as f:
+                f.write(banner + srt_pt)
+            logger.info(f"WORKER: Concluído {cache_key} (one-shot)")
+            return
+        except Exception as e:
+            logger.error(f"Write SRT error (one-shot): {e}")
+            # cai pro fallback por segurança
+
+    # ------- FALLBACK: batching (menos requisições, throttle) -------
     blocks = re.split(r"\n\n+", content)
     subs = []
     for block in blocks:
@@ -315,35 +375,43 @@ def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
                 "text": " ".join(lines[2:]).strip()
             })
 
-    # Sinalização de método
     final_srt_content = []
     final_srt_content.append(
-        f"0\n00:00:01,000 --> 00:00:05,000\n[AI Sync: {method} | Model: {GEMINI_MODEL}]\n"
+        f"0\n00:00:01,000 --> 00:00:05,000\n"
+        f"[AI Sync: {method} | Model: {GEMINI_MODEL} | mode=batch]\n"
     )
 
-    batch_size = 12  # menor batch reduz erros de JSON longo
+    batch_size = 40
+    throttle = 2.2  # segura para não levar 429 no free tier (~10 req/min)
+
     for i in range(0, len(subs), batch_size):
         chunk = subs[i:i + batch_size]
         texts_en = [s["text"] for s in chunk]
 
-        texts_pt = translate_batch_gemini(texts_en)
+        texts_pt = None
+        for attempt in range(2):
+            texts_pt = translate_batch_gemini(texts_en)
+            if texts_pt:
+                break
+            time.sleep(throttle + attempt)
+
         if not texts_pt:
             texts_pt = texts_en
-            logger.warning(f"Batch {i} falhou, usando EN.")
+            logger.warning(f"Batch {i} falhou (sem tradução), usando EN.")
 
         for idx, sub in enumerate(chunk):
             line_pt = texts_pt[idx] if idx < len(texts_pt) else sub["text"]
             line_pt = wrap_text(line_pt, width=44)
             final_srt_content.append(f"{sub['head']}\n{line_pt}\n")
 
-        time.sleep(1.2)  # respeitar limites
+        time.sleep(throttle)
 
     try:
         with open(final_path, "w", encoding="utf-8") as f:
             f.write("\n".join(final_srt_content))
-        logger.info(f"WORKER: Concluído {cache_key}")
+        logger.info(f"WORKER: Concluído {cache_key} (fallback batch)")
     except Exception as e:
-        logger.error(f"Write SRT error: {e}")
+        logger.error(f"Write SRT error (batch): {e}")
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -369,7 +437,6 @@ def subtitles(type, id, extra):
     filename_hint = None
 
     try:
-        # extra vem url-encoded (videoHash=...&filename=...)
         cleaned = extra.replace(".json", "")
         q = parse_qs(cleaned, keep_blank_values=True)
         if "videoHash" in q and q["videoHash"]:
