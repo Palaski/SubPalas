@@ -95,7 +95,7 @@ def translate_batch_gemini(texts):
     if not GEMINI_API_KEY:
         return None
 
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash-8b")
 
     prompt = (
         "Você é um tradutor profissional de legendas (EN -> PT-BR). "
@@ -374,3 +374,4 @@ def serve_subs(filename):
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
+
