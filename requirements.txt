@@ -1,5 +1,5 @@
 flask
 requests
 gunicorn
-ffsubsync
+deep-translator
 flask-cors
