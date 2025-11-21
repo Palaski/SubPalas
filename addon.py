@@ -4,30 +4,36 @@ import threading
 import time
 import requests
 import re
-import difflib
+import json
+import google.generativeai as genai
 from flask import Flask, jsonify, request, send_from_directory, make_response
 from flask_cors import CORS
-from deep_translator import GoogleTranslator
 
 app = Flask(__name__)
 CORS(app)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AutoTranslateAddon")
+logger = logging.getLogger("AutoTranslateAI")
 
 CACHE_DIR = os.path.join(os.getcwd(), "subtitle_cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# --- Configs ---
+# --- Configurações ---
 OS_API_KEY = os.getenv("OS_API_KEY", "")
-TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "") # Nova Variável!
+TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "")
+# Nova chave obrigatória para a IA
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
 USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
 
+# Configura o Gemini
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
 MANIFEST = {
-    "id": "community.autotranslate.ptbr",
-    "version": "0.2.0",
-    "name": "AutoSync + TorBox Integration",
-    "description": "Usa API do TorBox para extrair SRTs nativos ou traduzir a partir da release exata.",
+    "id": "community.autotranslate.ai",
+    "version": "0.3.0",
+    "name": "AutoSync AI (Gemini)",
+    "description": "Tradução de alta qualidade via Google Gemini + Busca inteligente de release.",
     "types": ["movie", "series"],
     "resources": ["subtitles"],
     "idPrefixes": ["tt"]
@@ -41,215 +47,188 @@ def get_file_hash(imdb_id, season=None, episode=None, video_hash=None):
     if video_hash: base += f"_{video_hash}"
     return base
 
-def similarity(a, b):
-    return difflib.SequenceMatcher(None, a.lower(), b.lower()).ratio()
+def clean_filename(name):
+    """Normaliza nome do arquivo para ajudar no match."""
+    return name.replace('.', ' ').replace('-', ' ').lower()
 
-# --- TorBox Logic ---
+# --- LLM Translation Logic (Gemini) ---
 
-def torbox_get_best_srt(video_hash, season, episode):
+def translate_batch_gemini(texts):
     """
-    Tenta encontrar um SRT dentro do pacote do TorBox.
-    Retorna (conteudo_srt, metodo) ou (None, None).
+    Usa Gemini Flash para traduzir uma lista de frases.
+    Retorna lista traduzida ou None se falhar.
     """
-    if not TORBOX_API_KEY or not video_hash: return None, None
+    if not GEMINI_API_KEY: return None
+
+    model = genai.GenerativeModel('gemini-1.5-flash')
     
-    headers = {"Authorization": f"Bearer {TORBOX_API_KEY}"}
+    # Prompt otimizado para legendas
+    prompt = (
+        "Você é um tradutor profissional de legendas (EN -> PT-BR). "
+        "Traduza a lista de frases JSON abaixo para Português do Brasil. "
+        "Regras: 1. Mantenha gírias e tom natural. 2. Seja conciso (limite de caracteres de TV). "
+        "3. Retorne APENAS um array JSON de strings strings ex: ['Olá', 'Tudo bem?']. "
+        "Não explique nada.\n\n"
+        f"Input: {json.dumps(texts)}"
+    )
+
     try:
-        # 1. Verificar se o hash existe no cache do TorBox
-        # A API do TorBox pode variar, usando endpoint de check cached
-        res = requests.get(f"https://api.torbox.app/v1/api/torrents/checkcached?hash={video_hash}&format=list&list_files=true", headers=headers, timeout=5)
-        data = res.json()
+        response = model.generate_content(prompt)
+        # Tenta extrair o JSON da resposta (as vezes vem com markdown ```json ... ```)
+        text_resp = response.text
+        if "```" in text_resp:
+            text_resp = text_resp.split("```json")[-1].split("```")[0].strip()
+            if not text_resp.strip().startswith("["): # Tenta pegar só o array se o split falhar
+                 text_resp = text_resp.split("[", 1)[-1].rsplit("]", 1)[0]
+                 text_resp = "[" + text_resp + "]"
         
-        if not data.get('success') or not data.get('data'):
-            return None, None
-
-        torrent_data = data['data'] # Pode ser uma lista ou dict dependendo da resposta exata
-        if isinstance(torrent_data, list): torrent_data = torrent_data[0]
+        translated = json.loads(text_resp)
         
-        files = torrent_data.get('files', [])
-        torrent_id = torrent_data.get('id') # Se disponivel, ou hash serve
-        
-        # 2. Filtrar arquivos SRT
-        srt_files = [f for f in files if f['name'].lower().endswith('.srt')]
-        if not srt_files: return None, None
-        
-        # 3. Encontrar o SRT correto (se for season pack)
-        target_srt = None
-        highest_score = 0
-        
-        # Se for serie, tenta dar match no SxxEyy
-        search_str = f"S{season:02d}E{episode:02d}".lower() if season else ""
-        
-        for f in srt_files:
-            fname = f['name'].lower()
-            score = 0
+        if isinstance(translated, list) and len(translated) == len(texts):
+            return translated
+        else:
+            logger.warning("Gemini: Tamanho do array não bate.")
+            return None
             
-            # Match de episódio
-            if season and search_str in fname: score += 50
-            
-            # Prioridade de linguagem
-            if 'pt-br' in fname or 'por' in fname or 'pob' in fname: score += 30
-            elif 'eng' in fname or 'en.' in fname: score += 10 # English é fallback para tradução
-            
-            if score > highest_score:
-                highest_score = score
-                target_srt = f
-        
-        if not target_srt or highest_score < 10: return None, None
-
-        # 4. Baixar o SRT
-        # Precisamos pedir o link de download pro TorBox
-        # Nota: O endpoint exato de request link pode variar, adaptando para o padrão comum
-        link_req = requests.get(f"https://api.torbox.app/v1/api/torrents/requestdl?token={TORBOX_API_KEY}&torrent_id={torrent_id}&file_id={target_srt['id']}", timeout=5)
-        link_data = link_req.json()
-        
-        if link_data.get('success') and link_data.get('data'):
-            download_url = link_data['data']
-            
-            # Baixa conteúdo
-            r = requests.get(download_url)
-            r.encoding = r.apparent_encoding
-            content = r.text.replace('\r\n', '\n')
-            
-            if 'pt-br' in target_srt['name'].lower() or 'por' in target_srt['name'].lower():
-                return content, "TorBox Native (PT-BR)"
-            else:
-                return content, "TorBox Native (EN -> Translate)"
-
     except Exception as e:
-        logger.error(f"TorBox Error: {e}")
-        
-    return None, None
+        logger.error(f"Gemini Error: {e}")
+        return None
 
-# --- OpenSubtitles Logic ---
+# --- Search Logic (Melhorada) ---
 
-def get_os_download_link(file_id, headers):
+def get_download_link(file_id, headers):
     try:
-        res = requests.post("https://api.opensubtitles.com/api/v1/download", headers=headers, json={"file_id": file_id})
+        res = requests.post("[https://api.opensubtitles.com/api/v1/download](https://api.opensubtitles.com/api/v1/download)", headers=headers, json={"file_id": file_id})
         return res.json().get('link')
     except: return None
 
-def search_english_sub(imdb_id, season=None, episode=None, video_hash=None):
+def search_english_sub(imdb_id, season=None, episode=None, video_hash=None, filename_hint=None):
+    """
+    Busca hierárquica:
+    1. Hash (Perfeito)
+    2. Release Name Match (Muito Bom)
+    3. Genérico (Fallback)
+    """
     if not OS_API_KEY: return None, "No API Key"
     headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     try: clean_id = int(imdb_id.replace("tt", ""))
     except: return None, "Bad ID"
 
-    # 1. Busca por HASH (Prioridade Máxima)
+    # 1. Busca por HASH
     if video_hash:
-        logger.info(f"--> Buscando HASH OS: {video_hash}")
+        logger.info(f"--> Buscando HASH: {video_hash}")
         try:
-            res = requests.get("https://api.opensubtitles.com/api/v1/subtitles", headers=headers, params={"moviehash": video_hash, "languages": "en"}, timeout=10)
+            res = requests.get("[https://api.opensubtitles.com/api/v1/subtitles](https://api.opensubtitles.com/api/v1/subtitles)", headers=headers, params={"moviehash": video_hash, "languages": "en"}, timeout=10)
             data = res.json()
             if data.get('total_count', 0) > 0:
-                return get_os_download_link(data['data'][0]['attributes']['files'][0]['file_id'], headers), "OS Hash Match"
-        except: pass
+                return get_download_link(data['data'][0]['attributes']['files'][0]['file_id'], headers), "Hash Match"
+        except Exception as e: logger.error(f"Erro Hash: {e}")
 
-    # 2. Busca Genérica IMDB
-    logger.info("--> Buscando IMDB Fallback")
+    # 2. Busca Genérica + Filtro de Release (Tenta corrigir o sync "totalmente fora")
+    logger.info("--> Buscando por Nome/IMDB")
     params = {"imdb_id": clean_id, "languages": "en", "order_by": "download_count", "order_direction": "desc"}
     if season: params.update({"season_number": season, "episode_number": episode})
     
     try:
-        res = requests.get("https://api.opensubtitles.com/api/v1/subtitles", headers=headers, params=params, timeout=10)
+        res = requests.get("[https://api.opensubtitles.com/api/v1/subtitles](https://api.opensubtitles.com/api/v1/subtitles)", headers=headers, params=params, timeout=10)
         data = res.json()
+        
         if data.get('total_count', 0) > 0:
-            return get_os_download_link(data['data'][0]['attributes']['files'][0]['file_id'], headers), "OS IMDB Match"
+            results = data['data']
+            best_file_id = results[0]['attributes']['files'][0]['file_id'] # Default: mais baixada
+            method = "IMDB Generic"
+
+            # Se tivermos uma dica do nome do arquivo (vindo do TorBox ou Extra)
+            if filename_hint:
+                hint_clean = clean_filename(filename_hint)
+                logger.info(f"Refinando busca para release: {filename_hint}")
+                
+                # Palavras chave criticas: WEB-DL, HDTV, BLURAY, AMZN, NETFLIX
+                keywords = [k for k in ['web', 'hdtv', 'bluray', 'dvd', 'amzn', 'nf', 'ntb'] if k in hint_clean]
+                
+                for item in results:
+                    f_name = item['attributes']['files'][0]['file_name'].lower()
+                    # Se todas as keywords criticas baterem
+                    if all(k in f_name for k in keywords):
+                        best_file_id = item['attributes']['files'][0]['file_id']
+                        method = f"Release Match ({' '.join(keywords)})"
+                        break
+            
+            return get_download_link(best_file_id, headers), method
     except: pass
     
-    return None, None
+    return None, "Not Found"
 
-# --- Worker Principal ---
+# --- Worker ---
 
-def worker(imdb_id, season, episode, cache_key, video_hash):
+def worker(imdb_id, season, episode, cache_key, video_hash, filename_hint=None):
     final_path = os.path.join(CACHE_DIR, f"{cache_key}_translated.srt")
     if os.path.exists(final_path): return
 
-    logger.info(f"WORKER: Iniciando {cache_key} Hash: {video_hash}")
+    logger.info(f"WORKER AI: Iniciando {cache_key}")
     
-    content = None
-    method = None
-    needs_translation = False
-
-    # FASE 1: Tentar TorBox (Extração Direta)
-    if video_hash and TORBOX_API_KEY:
-        logger.info("Tentando TorBox Extraction...")
-        tb_content, tb_method = torbox_get_best_srt(video_hash, season, episode)
-        if tb_content:
-            content = tb_content
-            method = tb_method
-            if "Translate" in method: needs_translation = True
+    # Tenta encontrar a melhor fonte EN
+    # Passamos o filename_hint se disponivel (pode vir do extra params no futuro)
+    url_en, method = search_english_sub(imdb_id, season, episode, video_hash, filename_hint)
     
-    # FASE 2: OpenSubtitles (Se TorBox falhou)
-    if not content:
-        url_en, method = search_english_sub(imdb_id, season, episode, video_hash)
-        if url_en:
-            try:
-                r = requests.get(url_en)
-                r.encoding = r.apparent_encoding
-                content = r.text.replace('\r\n', '\n')
-                needs_translation = True
-            except: pass
-
-    if not content:
-        logger.error("WORKER: Nenhuma fonte encontrada.")
+    if not url_en:
+        logger.error("WORKER: Sem fonte EN.")
         return
 
-    # FASE 3: Tradução (Se necessário)
-    final_content = content
-    
-    if needs_translation:
-        logger.info(f"Traduzindo via Google ({method})...")
-        try:
-            translator = GoogleTranslator(source='en', target='pt')
-            blocks = re.split(r'\n\n+', content)
-            subs = []
-            for block in blocks:
-                lines = block.strip().split('\n')
-                if len(lines) >= 3:
-                    subs.append({'head': "\n".join(lines[:2]), 'text': " ".join(lines[2:])})
-            
-            translated_subs = []
-            batch_size = 30
-            
-            # Header do arquivo
-            translated_subs.append(f"0\n00:00:01,000 --> 00:00:05,000\n[AutoSync: {method}]\n")
-            
-            for i in range(0, len(subs), batch_size):
-                chunk = subs[i:i+batch_size]
-                texts = [s['text'] for s in chunk]
-                
-                try:
-                    bulk = " ||| ".join(texts)
-                    if len(bulk) < 4500:
-                        res = translator.translate(bulk)
-                        if res:
-                            split = res.split(" ||| ")
-                            if len(split) == len(texts):
-                                for idx, txt in enumerate(split):
-                                    translated_subs.append(f"{chunk[idx]['head']}\n{txt.strip()}\n")
-                                continue
-                except: pass
-                
-                # Fallback para original se falhar batch
-                for s in chunk:
-                    translated_subs.append(f"{s['head']}\n{s['text']}\n")
-            
-            final_content = "\n".join(translated_subs)
-            
-        except Exception as e:
-            logger.error(f"Erro Tradução: {e}")
-            # Em erro, salva o original (EN) mas com nome translated para não falhar request
-            final_content = content
+    try:
+        r = requests.get(url_en)
+        r.encoding = r.apparent_encoding
+        content = r.text.replace('\r\n', '\n')
+    except: return
 
-    # Salvar
-    with open(final_path, 'w', encoding='utf-8') as f:
-        f.write(final_content)
+    # Parse SRT
+    blocks = re.split(r'\n\n+', content)
+    subs = []
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) >= 3:
+            # Guarda o bloco original para caso de falha
+            subs.append({'head': "\n".join(lines[:2]), 'text': " ".join(lines[2:])})
+
+    # Processamento AI (Batch)
+    final_srt_content = []
+    final_srt_content.append(f"0\n00:00:01,000 --> 00:00:05,000\n[AI Sync: {method}]\n")
+
+    batch_size = 20 # Gemini lida bem com blocos de ~20 falas
+    
+    for i in range(0, len(subs), batch_size):
+        chunk = subs[i:i+batch_size]
+        texts_en = [s['text'] for s in chunk]
+        
+        # Tenta traduzir com Gemini
+        texts_pt = translate_batch_gemini(texts_en)
+        
+        if not texts_pt:
+            # Fallback: Se Gemini falhar (rate limit/erro), usa original EN
+            texts_pt = texts_en 
+            logger.warning(f"Batch {i} falhou, usando EN.")
+
+        # Monta o SRT
+        for idx, sub in enumerate(chunk):
+            # Proteção contra alinhamento quebrado
+            if idx < len(texts_pt):
+                final_srt_content.append(f"{sub['head']}\n{texts_pt[idx]}\n")
+            else:
+                final_srt_content.append(f"{sub['head']}\n{sub['text']}\n")
                 
-    logger.info(f"WORKER: Sucesso {cache_key}")
+        # Pequeno sleep para respeitar rate limit do tier free (RPM)
+        time.sleep(1.5) 
+
+    # Salva
+    with open(final_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(final_srt_content))
+                
+    logger.info(f"WORKER: Concluído {cache_key}")
+
+# --- Rotas ---
 
 @app.route('/')
-def index(): return "AutoSync + TorBox v0.2.0"
+def index(): return "AutoSync AI v0.3.0"
 
 @app.route('/manifest.json')
 def manifest(): return jsonify(MANIFEST)
@@ -260,26 +239,34 @@ def subtitles(type, id, extra):
     imdb_id, season, episode = parts[0], int(parts[1]) if len(parts)>1 else None, int(parts[2]) if len(parts)>2 else None
     
     video_hash = None
+    filename_hint = None # Tenta extrair nome do arquivo da URL se possível
+    
     if "videoHash=" in extra:
         try: video_hash = extra.split("videoHash=")[1].split("&")[0]
         except: pass
     
+    # Alguns addons passam o 'filename' no extra, vamos tentar pegar
+    if "filename=" in extra:
+        try: filename_hint = extra.split("filename=")[1].split("&")[0]
+        except: pass
+
     cache_key = get_file_hash(imdb_id, season, episode, video_hash)
-    threading.Thread(target=worker, args=(imdb_id, season, episode, cache_key, video_hash)).start()
+    threading.Thread(target=worker, args=(imdb_id, season, episode, cache_key, video_hash, filename_hint)).start()
     
     host = request.host_url.rstrip('/')
-    return jsonify({"subtitles": [{"id": f"as_{cache_key}", "url": f"{host}/static_subs/{cache_key}_translated.srt", "lang": "pob", "format": "srt"}]})
+    return jsonify({"subtitles": [{"id": f"ai_{cache_key}", "url": f"{host}/static_subs/{cache_key}_translated.srt", "lang": "pob", "format": "srt"}]})
 
 @app.route('/static_subs/<filename>')
 def serve_subs(filename):
     path = os.path.join(CACHE_DIR, filename)
-    for _ in range(40):
+    # Timeout generoso pois AI demora um pouco mais
+    for _ in range(60): 
         if os.path.exists(path):
             resp = make_response(send_from_directory(CACHE_DIR, filename))
-            resp.headers['Cache-Control'] = 'no-cache'
+            resp.headers['Cache-Control'] = 'public, max-age=3600'
             return resp
         time.sleep(1)
-    return ("1\n00:00:01,000 --> 00:00:10,000\nBuscando no TorBox & Traduzindo...\n\n", 200, {'Content-Type': 'application/x-subrip'})
+    return ("1\n00:00:01,000 --> 00:00:10,000\nTraduzindo com IA...\nAguarde...\n\n", 200, {'Content-Type': 'application/x-subrip'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 7000)))
