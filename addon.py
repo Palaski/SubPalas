@@ -5,6 +5,8 @@ import time
 import requests
 import subprocess
 import shutil
+from urllib.parse import urlparse
+
 from flask import Flask, jsonify, request, send_from_directory, make_response
 from flask_cors import CORS
 
@@ -28,18 +30,16 @@ OS_USERNAME = os.getenv("OS_USERNAME", "")
 OS_PASSWORD = os.getenv("OS_PASSWORD", "")
 USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
 
-# OpenSubtitles base (pode ser substituído pelo base_url retornado no /login)
 _OS_DEFAULT_BASE_URL = "https://api.opensubtitles.com/api/v1"
 _os_base_url = _OS_DEFAULT_BASE_URL
 
-# Token cache (Bearer)
 _token_lock = threading.Lock()
 _os_token = None
-_os_token_expiry = 0  # epoch seconds (refresh preventivo)
+_os_token_expiry = 0
 
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.8",
+    "version": "0.0.9",
     "name": "AutoSync PT-BR (Triple Ref)",
     "description": "3 Versões: WEB (v1), HDTV (v2) e BluRay (v3). Teste as opções se houver drift.",
     "types": ["movie", "series"],
@@ -76,10 +76,6 @@ def generate_loading_srt(variant_name):
     )
 
 def ensure_placeholders(cache_key):
-    """
-    Cria placeholders imediatos para evitar timeout do Stremio.
-    Esses arquivos serão substituídos quando o sync terminar.
-    """
     for v, name in [("v1", "WEB-DL"), ("v2", "HDTV"), ("v3", "BluRay")]:
         p = os.path.join(CACHE_DIR, f"{cache_key}_{v}.srt")
         if not os.path.exists(p):
@@ -89,15 +85,43 @@ def ensure_placeholders(cache_key):
             except Exception as e:
                 logger.error(f"Falha criando placeholder {p}: {e}")
 
+def normalize_base_url(raw: str) -> str:
+    """
+    Garante que a base_url:
+      - tenha scheme (https://)
+      - termine em /api/v1
+    """
+    if not raw:
+        return _OS_DEFAULT_BASE_URL
+
+    raw = raw.strip()
+
+    # Se vier "api.opensubtitles.com" (sem scheme)
+    if not raw.startswith("http://") and not raw.startswith("https://"):
+        raw = "https://" + raw.lstrip("/")
+
+    # Se vier "https://api.opensubtitles.com" (sem /api/v1)
+    # ou "https://api.opensubtitles.com/" etc.
+    parsed = urlparse(raw)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = (parsed.path or "").rstrip("/")
+
+    # se já termina com /api/v1, ok
+    if path.endswith("/api/v1"):
+        return base + path
+
+    # se termina com /api, completa
+    if path.endswith("/api"):
+        return base + path + "/v1"
+
+    # se não tem nada útil, força /api/v1
+    return base + "/api/v1"
+
 # =========================
 # OpenSubtitles Auth + Requests
 # =========================
 
 def os_login():
-    """
-    Faz login para obter Bearer token (necessário para /download),
-    e captura base_url se o OpenSubtitles retornar um diferente.
-    """
     global _os_token, _os_base_url, _os_token_expiry
 
     if not (OS_API_KEY and OS_USERNAME and OS_PASSWORD):
@@ -122,7 +146,8 @@ def os_login():
             j = r.json()
 
             _os_token = j.get("token")
-            _os_base_url = j.get("base_url") or _OS_DEFAULT_BASE_URL
+            returned_base = j.get("base_url")  # pode vir sem https e sem /api/v1
+            _os_base_url = normalize_base_url(returned_base) if returned_base else _OS_DEFAULT_BASE_URL
 
             # refresh preventivo
             _os_token_expiry = now + 23 * 3600
@@ -132,6 +157,7 @@ def os_login():
                 _os_token_expiry = 0
                 return None, _os_base_url
 
+            logger.info(f"OpenSubtitles base_url em uso: {_os_base_url}")
             return _os_token, _os_base_url
 
         except Exception as e:
@@ -148,12 +174,7 @@ def os_login():
             return None, _os_base_url
 
 def os_headers(require_auth=False):
-    """
-    Monta headers padrão do OpenSubtitles.
-    Se require_auth=True, tenta incluir Authorization: Bearer.
-    """
     token, base_url = os_login() if require_auth else (None, _os_base_url)
-
     h = {
         "Api-Key": OS_API_KEY,
         "Content-Type": "application/json",
@@ -164,10 +185,6 @@ def os_headers(require_auth=False):
     return h, base_url
 
 def get_download_link(file_id):
-    """
-    /download geralmente exige Bearer token.
-    Faz retry 1x se receber 401/403, forçando refresh do token.
-    """
     headers, base_url = os_headers(require_auth=True)
 
     res = None
@@ -175,7 +192,6 @@ def get_download_link(file_id):
         res = requests.post(f"{base_url}/download", headers=headers, json={"file_id": file_id}, timeout=12)
 
         if res.status_code in (401, 403):
-            # força refresh token e tenta 1x
             global _os_token, _os_token_expiry
             with _token_lock:
                 _os_token = None
@@ -199,9 +215,6 @@ def get_download_link(file_id):
         return None
 
 def search_best_ptbr(imdb_id, season=None, episode=None):
-    """
-    Busca a melhor legenda PT-BR (target).
-    """
     if not OS_API_KEY:
         return None
 
@@ -211,7 +224,7 @@ def search_best_ptbr(imdb_id, season=None, episode=None):
     try:
         params = {
             "imdb_id": int(imdb_id.replace("tt", "")),
-            "languages": "pt-BR",  # importante
+            "languages": "pt-BR",
             "order_by": "download_count",
             "order_direction": "desc",
         }
@@ -241,9 +254,6 @@ def search_best_ptbr(imdb_id, season=None, episode=None):
     return None
 
 def search_references_opensubtitles(imdb_id, season=None, episode=None):
-    """
-    Busca 3 referências distintas: WEB, HDTV e BLURAY (EN).
-    """
     if not OS_API_KEY:
         return {}
 
@@ -338,10 +348,8 @@ def download_file(url, dest_path):
 def run_sync_thread(imdb_id, season, episode, cache_key):
     logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
 
-    # garante placeholders
     ensure_placeholders(cache_key)
 
-    # 1) Baixar PT-BR
     url_pt = search_best_ptbr(imdb_id, season, episode)
     if not url_pt:
         logger.error("Não achou PT-BR no OpenSubtitles (ou /download falhou).")
@@ -352,7 +360,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         logger.error("Falhou download PT-BR.")
         return
 
-    # 2) Baixar refs EN
     refs_dict = search_references_opensubtitles(imdb_id, season, episode)
     files_clean = [path_pt]
 
@@ -365,7 +372,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         cleanup_temp(files_clean)
         return
 
-    # Ordem fixa: v1=WEB, v2=HDTV, v3=BLURAY
     priority_order = ["WEB", "HDTV", "BLURAY", "DEFAULT"]
     final_refs = []
     for p in priority_order:
@@ -393,7 +399,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             p = subprocess.run(cmd, capture_output=True, text=True, check=True)
             if p.stderr:
                 logger.info(f"ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
-
             os.replace(tmp_out, final_path)
 
         except subprocess.CalledProcessError as e:
@@ -446,10 +451,8 @@ def subtitles(type, id, extra):
 
     cache_key = get_file_hash(imdb_id, season, episode)
 
-    # placeholder imediato
     ensure_placeholders(cache_key)
 
-    # dispara async
     threading.Thread(
         target=run_sync_thread,
         args=(imdb_id, season, episode, cache_key),
@@ -472,7 +475,6 @@ def serve_subs(filename):
 
     variant = "WEB-DL" if "_v1" in filename else "HDTV" if "_v2" in filename else "BluRay"
 
-    # placeholder deve existir, mas deixa retry curto
     max_retries = 5
     for _ in range(max_retries):
         if os.path.exists(file_path):
