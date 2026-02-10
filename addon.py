@@ -380,7 +380,7 @@ def _unmark_inflight(key: str):
     with _inflight_lock:
         _inflight.discard(key)
 
-defdef run_sync_thread(imdb_id, season, episode, cache_key):
+def run_sync_thread(imdb_id, season, episode, cache_key):
     if not _mark_inflight(cache_key):
         return
 
@@ -520,5 +520,6 @@ def serve_subs(filename):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
 
