@@ -27,7 +27,7 @@ USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
 
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.8",
+    "version": "0.0.9",
     "name": "AutoSync PT-BR (Triple Ref)",
     "description": "3 Versões: WEB (v1), HDTV (v2) e BluRay (v3).",
     "types": ["movie", "series"],
@@ -54,16 +54,21 @@ def generate_loading_srt(variant_name):
         "1\n00:00:00,000 --> 00:00:10,000\n"
         f"Sincronizando ({variant_name})... Aguarde...\n\n"
         "2\n00:00:10,500 --> 00:00:20,000\n"
-        "Se demorar muito, verifique os logs do servidor.\n"
+        "Se demorar muito, tente novamente em 10s.\n"
     )
 
-# --- Network Logic (Com Timeouts) ---
+# --- Network Logic (Fix 403) ---
 
 def download_file(url, dest_path):
     if not url: return False
     try:
-        # TIMEOUT DE 15 SEGUNDOS É CRUCIAL PARA NÃO TRAVAR A THREAD
-        with requests.get(url, stream=True, timeout=15) as r:
+        # CORREÇÃO: Adicionado User-Agent para evitar Erro 403 Forbidden
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*"
+        }
+        # Timeout para não travar a thread
+        with requests.get(url, stream=True, timeout=20, headers=headers) as r:
             r.raise_for_status()
             with open(dest_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -118,7 +123,6 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
                     link = get_download_link(fid, headers)
                     if link: references[rtype] = link
             
-            # Fallback
             if not references and len(results) > 0:
                  link = get_download_link(results[0]['attributes']['files'][0]['file_id'], headers)
                  if link: references['DEFAULT'] = link
@@ -198,8 +202,8 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", final_path, "--encoding", "utf-8"]
             logger.info(f"PASSO 3.{i}: Rodando ffsubsync...")
             try:
-                # Timeout no subprocesso também para não travar CPU
-                subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+                # Timeout aumentado para 90s para evitar corte prematuro em arquivos grandes
+                subprocess.run(cmd, capture_output=True, check=True, timeout=90)
                 logger.info(f"PASSO 3.{i}: SUCESSO! Arquivo gerado.")
             except subprocess.TimeoutExpired:
                 logger.error(f"PASSO 3.{i} FALHA: ffsubsync demorou demais.")
@@ -208,6 +212,8 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
                 break
             except Exception as e:
                 logger.error(f"PASSO 3.{i} FALHA: {e}")
+        else:
+            logger.error(f"PASSO 3.{i} FALHA: Erro baixar referencia.")
     
     cleanup_temp(files_clean)
     logger.info(f"--- FIM DO PROCESSO: {cache_key} ---")
@@ -215,7 +221,7 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
 # --- Rotas ---
 
 @app.route('/')
-def index(): return "AutoSync Debug Running"
+def index(): return "AutoSync Triple Ref v0.0.9 Running"
 
 @app.route('/manifest.json')
 def manifest(): return jsonify(MANIFEST)
@@ -227,7 +233,6 @@ def subtitles(type, id, extra):
     
     cache_key = get_file_hash(imdb_id, season, episode)
     
-    # Inicia thread
     threading.Thread(target=run_sync_thread, args=(imdb_id, season, episode, cache_key)).start()
 
     host = request.host_url.rstrip('/')
