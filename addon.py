@@ -380,28 +380,35 @@ def _unmark_inflight(key: str):
     with _inflight_lock:
         _inflight.discard(key)
 
-def run_sync_thread(imdb_id, season, episode, cache_key):
+defdef run_sync_thread(imdb_id, season, episode, cache_key):
     if not _mark_inflight(cache_key):
         return
 
     try:
-        logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
+        logger.info(f"[{cache_key}] START TRIPLE SYNC imdb={imdb_id} season={season} ep={episode}")
 
+        logger.info(f"[{cache_key}] Step 1: search_best_ptbr()")
         url_pt = search_best_ptbr(imdb_id, season, episode)
+        logger.info(f"[{cache_key}] PT-BR link: {'OK' if url_pt else 'NONE'}")
+
         if not url_pt:
-            logger.error("Não achou PT-BR no OpenSubtitles (ou /download falhou).")
+            logger.error(f"[{cache_key}] Não achou PT-BR no OpenSubtitles (ou /download falhou).")
             return
 
         path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
+        logger.info(f"[{cache_key}] Step 2: download PT-BR -> {path_pt}")
         if not download_file(url_pt, path_pt):
-            logger.error("Falhou download PT-BR.")
+            logger.error(f"[{cache_key}] Falhou download PT-BR.")
             return
 
+        logger.info(f"[{cache_key}] Step 3: search_references_opensubtitles()")
         refs_dict = search_references_opensubtitles(imdb_id, season, episode)
+        logger.info(f"[{cache_key}] refs found: {list(refs_dict.keys())}")
+
         files_clean = [path_pt]
 
         if not refs_dict:
-            logger.error("Não achou referências EN. Fallback: v1 = PT-BR puro.")
+            logger.error(f"[{cache_key}] Não achou referências EN. Fallback: v1 = PT-BR puro.")
             try:
                 shutil.copy(path_pt, os.path.join(CACHE_DIR, f"{cache_key}_v1.srt"))
             except Exception:
@@ -417,6 +424,8 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             if len(final_refs) >= 3:
                 break
 
+        logger.info(f"[{cache_key}] Step 4: syncing versions -> {[x[0] for x in final_refs]}")
+
         for i, (rtype, url) in enumerate(final_refs):
             version_label = f"v{i+1}"
             final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
@@ -425,50 +434,28 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{rtype}.srt")
             files_clean.append(path_ref)
 
+            logger.info(f"[{cache_key}] Download ref {rtype} -> {path_ref}")
             if not download_file(url, path_ref):
-                logger.error(f"Falhou download referência {rtype}.")
+                logger.error(f"[{cache_key}] Falhou download referência {rtype}.")
                 continue
 
             cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", tmp_out, "--encoding", "utf-8"]
-            logger.info(f"Syncing {version_label} ({rtype})...")
+            logger.info(f"[{cache_key}] ffsubsync {version_label} ({rtype}) running...")
 
-            try:
-                p = subprocess.run(cmd, capture_output=True, text=True, check=True)
-                if p.stderr:
-                    logger.info(f"ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
-                os.replace(tmp_out, final_path)
-
-            except subprocess.CalledProcessError as e:
-                logger.error(
-                    f"ffsubsync falhou ({version_label}) rc={e.returncode} "
-                    f"stderr={e.stderr[-500:] if e.stderr else ''}"
-                )
-                try:
-                    if os.path.exists(tmp_out):
-                        os.remove(tmp_out)
-                except Exception:
-                    pass
-            except FileNotFoundError:
-                logger.error("ffsubsync não está instalado no servidor (FileNotFoundError).")
-                try:
-                    if os.path.exists(tmp_out):
-                        os.remove(tmp_out)
-                except Exception:
-                    pass
-                break
-            except Exception as e:
-                logger.error(f"Erro inesperado ffsubsync ({version_label}): {e}")
-                try:
-                    if os.path.exists(tmp_out):
-                        os.remove(tmp_out)
-                except Exception:
-                    pass
+            p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if p.stderr:
+                logger.info(f"[{cache_key}] ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
+            os.replace(tmp_out, final_path)
+            logger.info(f"[{cache_key}] wrote {final_path}")
 
         cleanup_temp(files_clean)
-        logger.info(f"Concluído {cache_key}")
+        logger.info(f"[{cache_key}] DONE")
 
+    except Exception:
+        logger.exception(f"[{cache_key}] CRASH in run_sync_thread")
     finally:
         _unmark_inflight(cache_key)
+
 
 # =========================
 # Rotas
@@ -533,4 +520,5 @@ def serve_subs(filename):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
 
