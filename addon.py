@@ -325,17 +325,45 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
     return references
 
 def download_file(url, dest_path):
+    """
+    Baixa o arquivo do link retornado pelo /download.
+    IMPORTANTÍSSIMO: enviar User-Agent (e um Referer) ou o OpenSubtitles pode dar 403.
+    """
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Referer": "https://www.opensubtitles.com/",
+        # Alguns WAFs implicam com conexões sem este cabeçalho
+        "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
+        "Connection": "keep-alive",
+    }
+
     try:
-        with requests.get(url, stream=True, timeout=30) as r:
+        with requests.get(url, stream=True, timeout=45, headers=headers, allow_redirects=True) as r:
             r.raise_for_status()
             with open(dest_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
         return True
+    except requests.HTTPError as e:
+        # Fallback: tenta sem Referer (às vezes o WAF é chato ao contrário)
+        try:
+            headers2 = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+            with requests.get(url, stream=True, timeout=45, headers=headers2, allow_redirects=True) as r2:
+                r2.raise_for_status()
+                with open(dest_path, "wb") as f:
+                    for chunk in r2.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            return True
+        except Exception as e2:
+            logger.error(f"Falha download (fallback): {e2} url={url}")
+            return False
     except Exception as e:
         logger.error(f"Falha download: {e} url={url}")
         return False
+
 
 # =========================
 # Core Logic
@@ -505,3 +533,4 @@ def serve_subs(filename):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
