@@ -333,7 +333,6 @@ def download_file(url, dest_path):
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
         "Referer": "https://www.opensubtitles.com/",
-        # Alguns WAFs implicam com conexões sem este cabeçalho
         "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8,pt;q=0.7",
         "Connection": "keep-alive",
     }
@@ -346,8 +345,8 @@ def download_file(url, dest_path):
                     if chunk:
                         f.write(chunk)
         return True
-    except requests.HTTPError as e:
-        # Fallback: tenta sem Referer (às vezes o WAF é chato ao contrário)
+    except requests.HTTPError:
+        # Fallback: tenta sem Referer
         try:
             headers2 = {"User-Agent": USER_AGENT, "Accept": "*/*"}
             with requests.get(url, stream=True, timeout=45, headers=headers2, allow_redirects=True) as r2:
@@ -363,7 +362,6 @@ def download_file(url, dest_path):
     except Exception as e:
         logger.error(f"Falha download: {e} url={url}")
         return False
-
 
 # =========================
 # Core Logic
@@ -429,7 +427,10 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         for i, (rtype, url) in enumerate(final_refs):
             version_label = f"v{i+1}"
             final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
-            tmp_out = final_path + ".tmp"
+
+            # FIX: ffsubsync infere formato pela extensão. Se terminar em ".tmp", ele acha que o formato é "tmp".
+            # Então o temporário PRECISA terminar em ".srt".
+            tmp_out = os.path.join(CACHE_DIR, f".{cache_key}_{version_label}.tmp.srt")
 
             path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{rtype}.srt")
             files_clean.append(path_ref)
@@ -442,11 +443,28 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", tmp_out, "--encoding", "utf-8"]
             logger.info(f"[{cache_key}] ffsubsync {version_label} ({rtype}) running...")
 
-            p = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if p.stderr:
-                logger.info(f"[{cache_key}] ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
-            os.replace(tmp_out, final_path)
-            logger.info(f"[{cache_key}] wrote {final_path}")
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if p.stderr:
+                    logger.info(f"[{cache_key}] ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
+
+                # só troca se o arquivo realmente existe
+                if os.path.exists(tmp_out):
+                    os.replace(tmp_out, final_path)
+                    logger.info(f"[{cache_key}] wrote {final_path}")
+                else:
+                    logger.error(f"[{cache_key}] ffsubsync não gerou output esperado: {tmp_out}")
+
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    f"[{cache_key}] ffsubsync falhou ({version_label}) rc={e.returncode} "
+                    f"stderr={e.stderr[-500:] if e.stderr else ''}"
+                )
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
 
         cleanup_temp(files_clean)
         logger.info(f"[{cache_key}] DONE")
@@ -455,7 +473,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         logger.exception(f"[{cache_key}] CRASH in run_sync_thread")
     finally:
         _unmark_inflight(cache_key)
-
 
 # =========================
 # Rotas
@@ -478,7 +495,6 @@ def subtitles(type, id, extra):
 
     cache_key = get_file_hash(imdb_id, season, episode)
 
-    # dispara async (não depende de placeholder em disco)
     threading.Thread(
         target=run_sync_thread,
         args=(imdb_id, season, episode, cache_key),
@@ -497,12 +513,6 @@ def subtitles(type, id, extra):
 
 @app.route("/static_subs/<filename>")
 def serve_subs(filename):
-    """
-    Regra nova:
-      - se existe arquivo final: serve
-      - se não existe: devolve placeholder inline IMEDIATO
-    Isso remove totalmente o problema "placeholder não apareceu" (multi-worker).
-    """
     file_path = os.path.join(CACHE_DIR, filename)
 
     if os.path.exists(file_path):
@@ -520,6 +530,3 @@ def serve_subs(filename):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
-
-
-
