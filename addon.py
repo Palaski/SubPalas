@@ -20,7 +20,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 OS_API_KEY = os.getenv("OS_API_KEY", "")
-USER_AGENT = os.getenv("USER_AGENT", "StremioAutoSync v1.0")
+USER_AGENT = os.getenv("USER_AGENT", "SubPalas v2.1")
 
 
 
@@ -493,3 +493,4 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 7000))
 
     app.run(host='0.0.0.0', port=port)
+
