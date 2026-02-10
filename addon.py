@@ -20,8 +20,11 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoSyncAddon")
 
-CACHE_DIR = os.path.join(os.getcwd(), "subtitle_cache")
-TEMP_DIR = os.path.join(os.getcwd(), "temp_processing")
+# Em PaaS (Render etc.), /tmp é o lugar mais seguro pro filesystem efêmero.
+BASE_TMP = os.getenv("BASE_TMP", "/tmp")
+
+CACHE_DIR = os.path.join(BASE_TMP, "subtitle_cache")
+TEMP_DIR = os.path.join(BASE_TMP, "temp_processing")
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -37,9 +40,13 @@ _token_lock = threading.Lock()
 _os_token = None
 _os_token_expiry = 0
 
+# Evita disparar múltiplas threads pro mesmo item em paralelo (por worker)
+_inflight_lock = threading.Lock()
+_inflight = set()
+
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.9",
+    "version": "0.1.0",
     "name": "AutoSync PT-BR (Triple Ref)",
     "description": "3 Versões: WEB (v1), HDTV (v2) e BluRay (v3). Teste as opções se houver drift.",
     "types": ["movie", "series"],
@@ -65,7 +72,7 @@ def cleanup_temp(files):
             except Exception:
                 pass
 
-def generate_loading_srt(variant_name):
+def generate_loading_srt(variant_name: str):
     return (
         "1\n"
         "00:00:00,000 --> 00:00:10,000\n"
@@ -75,15 +82,12 @@ def generate_loading_srt(variant_name):
         "Se esta mensagem persistir por >30s,\nselecione outra versão na lista.\n"
     )
 
-def ensure_placeholders(cache_key):
-    for v, name in [("v1", "WEB-DL"), ("v2", "HDTV"), ("v3", "BluRay")]:
-        p = os.path.join(CACHE_DIR, f"{cache_key}_{v}.srt")
-        if not os.path.exists(p):
-            try:
-                with open(p, "w", encoding="utf-8") as f:
-                    f.write(generate_loading_srt(name))
-            except Exception as e:
-                logger.error(f"Falha criando placeholder {p}: {e}")
+def variant_from_filename(filename: str) -> str:
+    if "_v1" in filename:
+        return "WEB-DL"
+    if "_v2" in filename:
+        return "HDTV"
+    return "BluRay"
 
 def normalize_base_url(raw: str) -> str:
     """
@@ -96,25 +100,18 @@ def normalize_base_url(raw: str) -> str:
 
     raw = raw.strip()
 
-    # Se vier "api.opensubtitles.com" (sem scheme)
     if not raw.startswith("http://") and not raw.startswith("https://"):
         raw = "https://" + raw.lstrip("/")
 
-    # Se vier "https://api.opensubtitles.com" (sem /api/v1)
-    # ou "https://api.opensubtitles.com/" etc.
     parsed = urlparse(raw)
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = (parsed.path or "").rstrip("/")
 
-    # se já termina com /api/v1, ok
     if path.endswith("/api/v1"):
         return base + path
-
-    # se termina com /api, completa
     if path.endswith("/api"):
         return base + path + "/v1"
 
-    # se não tem nada útil, força /api/v1
     return base + "/api/v1"
 
 # =========================
@@ -146,10 +143,9 @@ def os_login():
             j = r.json()
 
             _os_token = j.get("token")
-            returned_base = j.get("base_url")  # pode vir sem https e sem /api/v1
+            returned_base = j.get("base_url")
             _os_base_url = normalize_base_url(returned_base) if returned_base else _OS_DEFAULT_BASE_URL
 
-            # refresh preventivo
             _os_token_expiry = now + 23 * 3600
 
             if not _os_token:
@@ -345,90 +341,106 @@ def download_file(url, dest_path):
 # Core Logic
 # =========================
 
+def _mark_inflight(key: str) -> bool:
+    with _inflight_lock:
+        if key in _inflight:
+            return False
+        _inflight.add(key)
+        return True
+
+def _unmark_inflight(key: str):
+    with _inflight_lock:
+        _inflight.discard(key)
+
 def run_sync_thread(imdb_id, season, episode, cache_key):
-    logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
-
-    ensure_placeholders(cache_key)
-
-    url_pt = search_best_ptbr(imdb_id, season, episode)
-    if not url_pt:
-        logger.error("Não achou PT-BR no OpenSubtitles (ou /download falhou).")
+    if not _mark_inflight(cache_key):
         return
 
-    path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
-    if not download_file(url_pt, path_pt):
-        logger.error("Falhou download PT-BR.")
-        return
+    try:
+        logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
 
-    refs_dict = search_references_opensubtitles(imdb_id, season, episode)
-    files_clean = [path_pt]
+        url_pt = search_best_ptbr(imdb_id, season, episode)
+        if not url_pt:
+            logger.error("Não achou PT-BR no OpenSubtitles (ou /download falhou).")
+            return
 
-    if not refs_dict:
-        logger.error("Não achou referências EN. Fallback: v1 = PT-BR puro.")
-        try:
-            shutil.copy(path_pt, os.path.join(CACHE_DIR, f"{cache_key}_v1.srt"))
-        except Exception:
-            pass
+        path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
+        if not download_file(url_pt, path_pt):
+            logger.error("Falhou download PT-BR.")
+            return
+
+        refs_dict = search_references_opensubtitles(imdb_id, season, episode)
+        files_clean = [path_pt]
+
+        if not refs_dict:
+            logger.error("Não achou referências EN. Fallback: v1 = PT-BR puro.")
+            try:
+                shutil.copy(path_pt, os.path.join(CACHE_DIR, f"{cache_key}_v1.srt"))
+            except Exception:
+                pass
+            cleanup_temp(files_clean)
+            return
+
+        priority_order = ["WEB", "HDTV", "BLURAY", "DEFAULT"]
+        final_refs = []
+        for p in priority_order:
+            if p in refs_dict:
+                final_refs.append((p, refs_dict[p]))
+            if len(final_refs) >= 3:
+                break
+
+        for i, (rtype, url) in enumerate(final_refs):
+            version_label = f"v{i+1}"
+            final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
+            tmp_out = final_path + ".tmp"
+
+            path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{rtype}.srt")
+            files_clean.append(path_ref)
+
+            if not download_file(url, path_ref):
+                logger.error(f"Falhou download referência {rtype}.")
+                continue
+
+            cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", tmp_out, "--encoding", "utf-8"]
+            logger.info(f"Syncing {version_label} ({rtype})...")
+
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                if p.stderr:
+                    logger.info(f"ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
+                os.replace(tmp_out, final_path)
+
+            except subprocess.CalledProcessError as e:
+                logger.error(
+                    f"ffsubsync falhou ({version_label}) rc={e.returncode} "
+                    f"stderr={e.stderr[-500:] if e.stderr else ''}"
+                )
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
+            except FileNotFoundError:
+                logger.error("ffsubsync não está instalado no servidor (FileNotFoundError).")
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
+                break
+            except Exception as e:
+                logger.error(f"Erro inesperado ffsubsync ({version_label}): {e}")
+                try:
+                    if os.path.exists(tmp_out):
+                        os.remove(tmp_out)
+                except Exception:
+                    pass
+
         cleanup_temp(files_clean)
-        return
+        logger.info(f"Concluído {cache_key}")
 
-    priority_order = ["WEB", "HDTV", "BLURAY", "DEFAULT"]
-    final_refs = []
-    for p in priority_order:
-        if p in refs_dict:
-            final_refs.append((p, refs_dict[p]))
-        if len(final_refs) >= 3:
-            break
-
-    for i, (rtype, url) in enumerate(final_refs):
-        version_label = f"v{i+1}"
-        final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
-        tmp_out = final_path + ".tmp"
-
-        path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{rtype}.srt")
-        files_clean.append(path_ref)
-
-        if not download_file(url, path_ref):
-            logger.error(f"Falhou download referência {rtype}.")
-            continue
-
-        cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", tmp_out, "--encoding", "utf-8"]
-        logger.info(f"Syncing {version_label} ({rtype})...")
-
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            if p.stderr:
-                logger.info(f"ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
-            os.replace(tmp_out, final_path)
-
-        except subprocess.CalledProcessError as e:
-            logger.error(
-                f"ffsubsync falhou ({version_label}) rc={e.returncode} "
-                f"stderr={e.stderr[-500:] if e.stderr else ''}"
-            )
-            try:
-                if os.path.exists(tmp_out):
-                    os.remove(tmp_out)
-            except Exception:
-                pass
-        except FileNotFoundError:
-            logger.error("ffsubsync não está instalado no servidor (FileNotFoundError).")
-            try:
-                if os.path.exists(tmp_out):
-                    os.remove(tmp_out)
-            except Exception:
-                pass
-            break
-        except Exception as e:
-            logger.error(f"Erro inesperado ffsubsync ({version_label}): {e}")
-            try:
-                if os.path.exists(tmp_out):
-                    os.remove(tmp_out)
-            except Exception:
-                pass
-
-    cleanup_temp(files_clean)
-    logger.info(f"Concluído {cache_key}")
+    finally:
+        _unmark_inflight(cache_key)
 
 # =========================
 # Rotas
@@ -451,8 +463,7 @@ def subtitles(type, id, extra):
 
     cache_key = get_file_hash(imdb_id, season, episode)
 
-    ensure_placeholders(cache_key)
-
+    # dispara async (não depende de placeholder em disco)
     threading.Thread(
         target=run_sync_thread,
         args=(imdb_id, season, episode, cache_key),
@@ -471,19 +482,20 @@ def subtitles(type, id, extra):
 
 @app.route("/static_subs/<filename>")
 def serve_subs(filename):
+    """
+    Regra nova:
+      - se existe arquivo final: serve
+      - se não existe: devolve placeholder inline IMEDIATO
+    Isso remove totalmente o problema "placeholder não apareceu" (multi-worker).
+    """
     file_path = os.path.join(CACHE_DIR, filename)
 
-    variant = "WEB-DL" if "_v1" in filename else "HDTV" if "_v2" in filename else "BluRay"
+    if os.path.exists(file_path):
+        response = make_response(send_from_directory(CACHE_DIR, filename))
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        return response
 
-    max_retries = 5
-    for _ in range(max_retries):
-        if os.path.exists(file_path):
-            response = make_response(send_from_directory(CACHE_DIR, filename))
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            return response
-        time.sleep(1)
-
-    logger.info(f"Timeout servindo {filename} (nem placeholder apareceu?)")
+    variant = variant_from_filename(filename)
     response = make_response(generate_loading_srt(variant))
     response.headers["Content-Type"] = "application/x-subrip"
     response.headers["Content-Disposition"] = f'inline; filename="{filename}"'
