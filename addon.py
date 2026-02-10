@@ -27,17 +27,17 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # Chaves de API
 OS_API_KEY = os.getenv("OS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
-USER_AGENT = os.getenv("USER_AGENT", "SubPalas v2.0")
+USER_AGENT = os.getenv("USER_AGENT", "SubPalas v2.1")
 
 # Configura Gemini se houver chave
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 MANIFEST = {
-    "id": "org.subpalas.hybrid",
-    "version": "2.0.0",
-    "name": "SubPalas", # Nome atualizado conforme pedido
-    "description": "Legendas PT-BR. Tenta Sincronizar (ffsubsync). Se falhar, Traduz (Gemini).",
+    "id": "org.subpalas.lite",
+    "version": "2.1.0",
+    "name": "SubPalas (Lite)",
+    "description": "Legendas PT-BR Otimizadas. Sincronia única (Fast) ou Tradução IA.",
     "types": ["movie", "series"],
     "resources": ["subtitles"],
     "idPrefixes": ["tt"]
@@ -59,9 +59,9 @@ def cleanup_temp(files):
 def generate_loading_srt(msg="Carregando..."):
     return (
         "1\n00:00:00,000 --> 00:00:10,000\n"
-        f"SubPalas: {msg}\nIsso pode levar de 10 a 60 segundos.\n\n"
+        f"SubPalas: {msg}\nAguarde o processamento...\n\n"
         "2\n00:00:10,500 --> 00:00:20,000\n"
-        "Se não carregar, tente selecionar novamente.\n"
+        "Se demorar, volte e selecione novamente.\n"
     )
 
 # --- Network Logic ---
@@ -102,7 +102,7 @@ def search_subtitles(imdb_id, lang, season=None, episode=None):
         data = res.json()
         
         if data.get('total_count', 0) > 0:
-            return data['data'] # Retorna lista bruta para processar
+            return data['data'] # Retorna lista bruta
     except Exception as e:
         logger.error(f"Erro busca {lang}: {e}")
     return None
@@ -129,21 +129,18 @@ def translate_batch_gemini(texts):
     return None
 
 def run_translation_fallback(imdb_id, season, episode, cache_key):
-    """Lógica de Fallback: Baixa EN -> Traduz -> Salva como v1"""
+    """Lógica de Fallback: Baixa EN -> Traduz -> Salva"""
     logger.info("FALLBACK: Iniciando tradução via IA...")
     
-    # Busca EN
     results_en = search_subtitles(imdb_id, "en", season, episode)
     if not results_en:
         logger.error("FALLBACK: Nem legenda em inglês foi encontrada.")
         return
 
-    # Pega o link da mais popular
     best_file = results_en[0]['attributes']['files'][0]
     headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     url_en = get_download_link(best_file['file_id'], headers)
     
-    # Baixa e Traduz
     try:
         r = requests.get(url_en, headers={"User-Agent": USER_AGENT})
         content = r.text.replace('\r\n', '\n')
@@ -162,44 +159,41 @@ def run_translation_fallback(imdb_id, season, episode, cache_key):
             chunk = subs[i:i+batch_size]
             texts = [s['text'] for s in chunk]
             translated = translate_batch_gemini(texts)
-            
-            # Se falhar, usa original
             target_texts = translated if translated else texts
             
             for idx, txt in enumerate(target_texts):
                 final_content.append(f"{chunk[idx]['head']}\n{txt}\n")
-            time.sleep(1) # Rate limit safe
+            time.sleep(1)
 
-        # Salva como v1 (Principal)
-        final_path = os.path.join(CACHE_DIR, f"{cache_key}_v1.srt")
+        final_path = os.path.join(CACHE_DIR, f"{cache_key}_synced.srt")
         with open(final_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(final_content))
             
-        logger.info("FALLBACK: Tradução concluída com sucesso.")
+        logger.info("FALLBACK: Tradução concluída.")
         
     except Exception as e:
         logger.error(f"FALLBACK Error: {e}")
 
-# --- Core Logic Principal ---
+# --- Core Logic Principal (Single Sync) ---
 
 def run_process(imdb_id, season, episode, cache_key):
-    v1_marker = os.path.join(CACHE_DIR, f"{cache_key}_v1.srt")
-    if os.path.exists(v1_marker) and os.path.getsize(v1_marker) > 100: 
-        return # Cache Hit
-
-    logger.info(f"--- PROCESSANDO: {cache_key} ---")
+    final_path = os.path.join(CACHE_DIR, f"{cache_key}_synced.srt")
     
-    # 1. Tenta achar PT-BR (Estratégia Principal)
+    # Se já existe e é válido, não faz nada
+    if os.path.exists(final_path) and os.path.getsize(final_path) > 100: 
+        return
+
+    logger.info(f"--- PROCESSANDO (LITE): {cache_key} ---")
+    
+    # 1. Busca PT-BR
     ptbr_results = search_subtitles(imdb_id, "pt-br", season, episode)
     
     if not ptbr_results:
-        # Se não achou PT-BR, vai para o Fallback (Tradução)
         logger.warning("PT-BR não encontrada. Ativando Fallback IA.")
         run_translation_fallback(imdb_id, season, episode, cache_key)
         return
 
-    # Se achou PT-BR, segue com a Sincronia (ffsubsync)
-    logger.info("PT-BR encontrada. Iniciando Sincronia...")
+    logger.info("PT-BR encontrada. Buscando melhor referência EN...")
     
     headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
     url_pt = get_download_link(ptbr_results[0]['attributes']['files'][0]['file_id'], headers)
@@ -207,69 +201,59 @@ def run_process(imdb_id, season, episode, cache_key):
     path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
     if not download_file(url_pt, path_pt): return
 
-    # Busca Ref EN para sincronia
+    # 2. Busca Ref EN (Apenas 1 Melhor Opção)
     en_results = search_subtitles(imdb_id, "en", season, episode)
     if not en_results:
-        # Se não tem ref EN, salva PT original como v1
-        shutil.copy(path_pt, v1_marker)
+        shutil.copy(path_pt, final_path) # Sem ref, usa original
         return
 
-    # Seleciona 3 Refs (WEB, HDTV, BLURAY)
-    refs_map = {}
+    # Seletor Inteligente de Única Referência (Prioridade WEB > HDTV > Popular)
+    best_ref_url = None
+    ref_type = "POPULAR"
+    
+    # Tenta achar WEB-DL primeiro (Melhor para Stremio)
     for item in en_results:
-        if len(refs_map) >= 3: break
-        f = item['attributes']['files'][0]
-        fname = f['file_name'].lower()
-        
-        rtype = 'DEFAULT'
-        if any(x in fname for x in ['web', 'amzn']): rtype = 'WEB'
-        elif 'bluray' in fname: rtype = 'BLURAY'
-        elif 'hdtv' in fname: rtype = 'HDTV'
-        
-        if rtype not in refs_map:
-            link = get_download_link(f['file_id'], headers)
-            if link: refs_map[rtype] = link
+        fname = item['attributes']['files'][0]['file_name'].lower()
+        if 'web' in fname or 'amzn' in fname or 'nf' in fname:
+            best_ref_url = get_download_link(item['attributes']['files'][0]['file_id'], headers)
+            ref_type = "WEB-DL"
+            break
+    
+    # Se não achou, tenta HDTV
+    if not best_ref_url:
+        for item in en_results:
+            fname = item['attributes']['files'][0]['file_name'].lower()
+            if 'hdtv' in fname:
+                best_ref_url = get_download_link(item['attributes']['files'][0]['file_id'], headers)
+                ref_type = "HDTV"
+                break
+    
+    # Se nada, pega a primeira (Mais popular)
+    if not best_ref_url:
+        best_ref_url = get_download_link(en_results[0]['attributes']['files'][0]['file_id'], headers)
 
-    # Executa ffsubsync
-    files_clean = [path_pt]
-    
-    # Ordem: Se tiver WEB, v1 = WEB. Se não tiver, v1 = Primeira que achou.
-    # Garantir que v1 sempre exista é crucial.
-    targets = [('WEB', 'v1'), ('HDTV', 'v2'), ('BLURAY', 'v3')]
-    
-    # Fallback se não achou tipos especificos: usa a primeira que tiver para v1
-    if not refs_map:
-         # Logica de segurança extrema
-         shutil.copy(path_pt, v1_marker)
+    if best_ref_url:
+        path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref.srt")
+        if download_file(best_ref_url, path_ref):
+            cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", final_path, "--encoding", "utf-8"]
+            logger.info(f"Sincronizando com {ref_type}...")
+            try:
+                subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+                logger.info("Sincronia concluída com sucesso.")
+            except Exception as e:
+                logger.error(f"Erro ffsubsync: {e}")
+                shutil.copy(path_pt, final_path) # Fallback para original em erro
+        else:
+            shutil.copy(path_pt, final_path)
     else:
-        # Preenche slots
-        used_default = False
-        for rtype, label in targets:
-            url_ref = refs_map.get(rtype)
-            
-            # Se não tem WEB especifico, usa DEFAULT ou a primeira disponível para v1
-            if not url_ref and label == 'v1' and not used_default:
-                url_ref = list(refs_map.values())[0]
-                used_default = True
-            
-            if url_ref:
-                path_ref = os.path.join(TEMP_DIR, f"{cache_key}_ref_{label}.srt")
-                final_path = os.path.join(CACHE_DIR, f"{cache_key}_{label}.srt")
-                files_clean.append(path_ref)
-                
-                if download_file(url_ref, path_ref):
-                    cmd = ["ffsubsync", path_ref, "-i", path_pt, "-o", final_path, "--encoding", "utf-8"]
-                    try:
-                        subprocess.run(cmd, capture_output=True, check=True, timeout=90)
-                        logger.info(f"Sync OK: {label} ({rtype})")
-                    except: pass
+        shutil.copy(path_pt, final_path)
 
-    cleanup_temp(files_clean)
+    cleanup_temp([path_pt, os.path.join(TEMP_DIR, f"{cache_key}_ref.srt")])
 
 # --- Rotas ---
 
 @app.route('/')
-def index(): return "SubPalas v2.0 Running"
+def index(): return "SubPalas Lite v2.1 Running"
 
 @app.route('/manifest.json')
 def manifest(): return jsonify(MANIFEST)
@@ -280,47 +264,36 @@ def subtitles(type, id, extra):
     imdb_id, season, episode = parts[0], int(parts[1]) if len(parts)>1 else None, int(parts[2]) if len(parts)>2 else None
     cache_key = get_file_hash(imdb_id, season, episode)
     
+    # Dispara processamento leve (1 thread apenas)
     threading.Thread(target=run_process, args=(imdb_id, season, episode, cache_key)).start()
+    
     host = request.host_url.rstrip('/')
     
-    # Verifica o que temos disponível
-    subs = []
-    
-    # Se existe v1 (Principal)
-    # Se só existir v1 (caso de tradução), retornamos só ele.
-    # Se existirem v2/v3 (caso de sync), retornamos todos.
-    
-    # Nota: Como o processo é assincrono, na primeira chamada não sabemos o que vai existir.
-    # Retornamos os slots 'otimistas'. Se o arquivo nunca for criado (ex: só criou v1), o Stremio vai dar 404 no v2/v3 e não mostra nada.
-    
-    subs.append({"id": f"sp_v1_{cache_key}", "url": f"{host}/static_subs/{cache_key}_v1.srt", "lang": "pob", "format": "srt"})
-    subs.append({"id": f"sp_v2_{cache_key}", "url": f"{host}/static_subs/{cache_key}_v2.srt", "lang": "pob", "format": "srt"})
-    subs.append({"id": f"sp_v3_{cache_key}", "url": f"{host}/static_subs/{cache_key}_v3.srt", "lang": "pob", "format": "srt"})
-
-    return jsonify({"subtitles": subs})
+    # Retorna apenas UMA opção unificada
+    return jsonify({
+        "subtitles": [
+            {
+                "id": f"sp_sync_{cache_key}",
+                "url": f"{host}/static_subs/{cache_key}_synced.srt",
+                "lang": "pob",
+                "format": "srt"
+            }
+        ]
+    })
 
 @app.route('/static_subs/<filename>')
 def serve_subs(filename):
     path = os.path.join(CACHE_DIR, filename)
     
-    # Tenta esperar um pouco
-    for _ in range(40):
-        if os.path.exists(path) and os.path.getsize(path) > 0:
+    # Espera até 45s (suficiente para 1 sync)
+    for _ in range(45):
+        if os.path.exists(path) and os.path.getsize(path) > 100:
             resp = make_response(send_from_directory(CACHE_DIR, filename))
             resp.headers['Cache-Control'] = 'public, max-age=31536000'
             return resp
         time.sleep(1)
         
-    # Se estourar o tempo e for v2 ou v3, verificamos se v1 existe. 
-    # Se v1 existe mas v2 não, provavelmente estamos no modo Tradução (só gera v1).
-    # Nesse caso, retornamos 404 para o Stremio entender que não tem essa opção.
-    if "_v2" in filename or "_v3" in filename:
-        v1_path = path.replace("_v2", "_v1").replace("_v3", "_v1")
-        if os.path.exists(v1_path):
-            return "Not Found", 404
-
-    # Se for v1 e estourou, manda aviso de carregando
-    return generate_loading_srt("Processando..."), 200, {'Content-Type': 'application/x-subrip'}
+    return generate_loading_srt("Sincronizando..."), 200, {'Content-Type': 'application/x-subrip'}
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 7000))
