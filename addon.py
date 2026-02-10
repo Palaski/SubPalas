@@ -8,7 +8,9 @@ import shutil
 from flask import Flask, jsonify, request, send_from_directory, make_response
 from flask_cors import CORS
 
-# --- Configurações ---
+# =========================
+# Configurações
+# =========================
 
 app = Flask(__name__)
 CORS(app)
@@ -37,7 +39,7 @@ _os_token_expiry = 0  # epoch seconds (refresh preventivo)
 
 MANIFEST = {
     "id": "community.autosync.ptbr",
-    "version": "0.0.7",
+    "version": "0.0.8",
     "name": "AutoSync PT-BR (Triple Ref)",
     "description": "3 Versões: WEB (v1), HDTV (v2) e BluRay (v3). Teste as opções se houver drift.",
     "types": ["movie", "series"],
@@ -45,7 +47,9 @@ MANIFEST = {
     "idPrefixes": ["tt"]
 }
 
-# --- Utilitários ---
+# =========================
+# Utilitários
+# =========================
 
 def get_file_hash(imdb_id, season=None, episode=None):
     base = f"{imdb_id}"
@@ -62,8 +66,7 @@ def cleanup_temp(files):
                 pass
 
 def generate_loading_srt(variant_name):
-    """Gera um SRT de aviso."""
-    srt_content = (
+    return (
         "1\n"
         "00:00:00,000 --> 00:00:10,000\n"
         f"Sincronizando ({variant_name})... Aguarde...\n\n"
@@ -71,11 +74,10 @@ def generate_loading_srt(variant_name):
         "00:00:10,500 --> 00:00:20,000\n"
         "Se esta mensagem persistir por >30s,\nselecione outra versão na lista.\n"
     )
-    return srt_content
 
 def ensure_placeholders(cache_key):
     """
-    Cria placeholders imediatos pra evitar timeout do Stremio.
+    Cria placeholders imediatos para evitar timeout do Stremio.
     Esses arquivos serão substituídos quando o sync terminar.
     """
     for v, name in [("v1", "WEB-DL"), ("v2", "HDTV"), ("v3", "BluRay")]:
@@ -87,7 +89,9 @@ def ensure_placeholders(cache_key):
             except Exception as e:
                 logger.error(f"Falha criando placeholder {p}: {e}")
 
-# --- OpenSubtitles Auth + Requests ---
+# =========================
+# OpenSubtitles Auth + Requests
+# =========================
 
 def os_login():
     """
@@ -111,14 +115,16 @@ def os_login():
         }
         payload = {"username": OS_USERNAME, "password": OS_PASSWORD}
 
+        r = None
         try:
             r = requests.post(f"{_OS_DEFAULT_BASE_URL}/login", headers=headers, json=payload, timeout=12)
             r.raise_for_status()
             j = r.json()
+
             _os_token = j.get("token")
             _os_base_url = j.get("base_url") or _OS_DEFAULT_BASE_URL
 
-            # refresh preventivo (token pode durar mais; aqui garantimos que vai renovar)
+            # refresh preventivo
             _os_token_expiry = now + 23 * 3600
 
             if not _os_token:
@@ -129,7 +135,12 @@ def os_login():
             return _os_token, _os_base_url
 
         except Exception as e:
-            body = getattr(r, "text", "")[:300] if "r" in locals() else ""
+            body = ""
+            if r is not None:
+                try:
+                    body = r.text[:300]
+                except Exception:
+                    body = ""
             logger.error(f"OpenSubtitles login falhou: {e} | resp={body}")
             _os_token = None
             _os_token_expiry = 0
@@ -159,6 +170,7 @@ def get_download_link(file_id):
     """
     headers, base_url = os_headers(require_auth=True)
 
+    res = None
     try:
         res = requests.post(f"{base_url}/download", headers=headers, json={"file_id": file_id}, timeout=12)
 
@@ -168,6 +180,7 @@ def get_download_link(file_id):
             with _token_lock:
                 _os_token = None
                 _os_token_expiry = 0
+
             headers, base_url = os_headers(require_auth=True)
             res = requests.post(f"{base_url}/download", headers=headers, json={"file_id": file_id}, timeout=12)
 
@@ -175,11 +188,57 @@ def get_download_link(file_id):
         return res.json().get("link")
 
     except Exception as e:
-        logger.error(
-            f"Erro /download file_id={file_id}: {e} | status={getattr(res,'status_code',None)} "
-            f"| body={getattr(res,'text','')[:300]}"
-        )
+        body = ""
+        status = getattr(res, "status_code", None)
+        if res is not None:
+            try:
+                body = res.text[:300]
+            except Exception:
+                body = ""
+        logger.error(f"Erro /download file_id={file_id}: {e} | status={status} | body={body}")
         return None
+
+def search_best_ptbr(imdb_id, season=None, episode=None):
+    """
+    Busca a melhor legenda PT-BR (target).
+    """
+    if not OS_API_KEY:
+        return None
+
+    headers, base_url = os_headers(require_auth=False)
+    res = None
+
+    try:
+        params = {
+            "imdb_id": int(imdb_id.replace("tt", "")),
+            "languages": "pt-BR",  # importante
+            "order_by": "download_count",
+            "order_direction": "desc",
+        }
+        if season is not None and episode is not None:
+            params.update({"season_number": season, "episode_number": episode})
+
+        res = requests.get(f"{base_url}/subtitles", headers=headers, params=params, timeout=12)
+        res.raise_for_status()
+        data = res.json()
+
+        logger.info(f"PT-BR total_count={data.get('total_count')} page={data.get('page')}")
+
+        if data.get("total_count", 0) > 0 and data.get("data"):
+            files = data["data"][0].get("attributes", {}).get("files", []) or []
+            if files and files[0].get("file_id"):
+                return get_download_link(files[0]["file_id"])
+
+    except Exception as e:
+        body = ""
+        if res is not None:
+            try:
+                body = res.text[:300]
+            except Exception:
+                body = ""
+        logger.error(f"Erro busca PT-BR: {e} | body={body}")
+
+    return None
 
 def search_references_opensubtitles(imdb_id, season=None, episode=None):
     """
@@ -189,6 +248,7 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
         return {}
 
     headers, base_url = os_headers(require_auth=False)
+    res = None
 
     try:
         clean_id = int(imdb_id.replace("tt", ""))
@@ -204,20 +264,20 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
     if season is not None and episode is not None:
         params.update({"season_number": season, "episode_number": episode})
 
-    references = {}  # {'WEB': url, 'HDTV': url, 'BLURAY': url}
+    references = {}
 
     try:
         res = requests.get(f"{base_url}/subtitles", headers=headers, params=params, timeout=12)
         res.raise_for_status()
         data = res.json()
 
-        results = data.get("data", [])
+        results = data.get("data", []) or []
         if data.get("total_count", 0) > 0 and results:
             for item in results:
                 if len(references) >= 3:
                     break
 
-                files = item.get("attributes", {}).get("files", [])
+                files = item.get("attributes", {}).get("files", []) or []
                 if not files:
                     continue
 
@@ -240,51 +300,23 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
                     if link:
                         references[rtype] = link
 
-            # fallback
             if not references and results:
-                first_files = results[0].get("attributes", {}).get("files", [])
+                first_files = results[0].get("attributes", {}).get("files", []) or []
                 if first_files and first_files[0].get("file_id"):
                     link = get_download_link(first_files[0]["file_id"])
                     if link:
                         references["DEFAULT"] = link
 
     except Exception as e:
-        logger.error(f"Erro busca EN: {e} | body={getattr(res,'text','')[:300] if 'res' in locals() else ''}")
+        body = ""
+        if res is not None:
+            try:
+                body = res.text[:300]
+            except Exception:
+                body = ""
+        logger.error(f"Erro busca EN: {e} | body={body}")
 
     return references
-
-def search_best_ptbr(imdb_id, season=None, episode=None):
-    """
-    Busca a melhor legenda PT-BR (target).
-    """
-    if not OS_API_KEY:
-        return None
-
-    headers, base_url = os_headers(require_auth=False)
-
-    try:
-        params = {
-            "imdb_id": int(imdb_id.replace("tt", "")),
-            "languages": "pt-br",
-            "order_by": "download_count",
-            "order_direction": "desc",
-        }
-        if season is not None and episode is not None:
-            params.update({"season_number": season, "episode_number": episode})
-
-        res = requests.get(f"{base_url}/subtitles", headers=headers, params=params, timeout=12)
-        res.raise_for_status()
-        data = res.json()
-
-        if data.get("total_count", 0) > 0 and data.get("data"):
-            f = data["data"][0].get("attributes", {}).get("files", [])
-            if f and f[0].get("file_id"):
-                return get_download_link(f[0]["file_id"])
-
-    except Exception as e:
-        logger.error(f"Erro busca PT-BR: {e} | body={getattr(res,'text','')[:300] if 'res' in locals() else ''}")
-
-    return None
 
 def download_file(url, dest_path):
     try:
@@ -299,26 +331,20 @@ def download_file(url, dest_path):
         logger.error(f"Falha download: {e} url={url}")
         return False
 
-# --- Core Logic ---
+# =========================
+# Core Logic
+# =========================
 
 def run_sync_thread(imdb_id, season, episode, cache_key):
-    # Se já existe v1 “real” (não placeholder), você pode decidir pular.
-    # Aqui mantemos simples: se existe e tem tamanho > 0, assume processado.
-    v1_path = os.path.join(CACHE_DIR, f"{cache_key}_v1.srt")
-    if os.path.exists(v1_path) and os.path.getsize(v1_path) > 0:
-        # Ainda pode ser placeholder, mas não tem um jeito perfeito sem marcar.
-        # Mantemos o fluxo e deixamos reprocessar se quiser.
-        pass
-
     logger.info(f"Processando TRIPLE SYNC para {cache_key}...")
 
-    # 0) garante placeholders (caso alguém bata direto no /static_subs)
+    # garante placeholders
     ensure_placeholders(cache_key)
 
-    # 1) Baixar PT-BR (Target)
+    # 1) Baixar PT-BR
     url_pt = search_best_ptbr(imdb_id, season, episode)
     if not url_pt:
-        logger.error("Não achou PT-BR no OpenSubtitles.")
+        logger.error("Não achou PT-BR no OpenSubtitles (ou /download falhou).")
         return
 
     path_pt = os.path.join(TEMP_DIR, f"{cache_key}_pt.srt")
@@ -326,13 +352,12 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         logger.error("Falhou download PT-BR.")
         return
 
-    # 2) Baixar Referências EN (WEB/HDTV/BLURAY)
+    # 2) Baixar refs EN
     refs_dict = search_references_opensubtitles(imdb_id, season, episode)
     files_clean = [path_pt]
 
     if not refs_dict:
-        logger.error("Não achou referências EN. Mantendo placeholders/target.")
-        # fallback: se quiser, sobrepõe v1 com PT-BR puro
+        logger.error("Não achou referências EN. Fallback: v1 = PT-BR puro.")
         try:
             shutil.copy(path_pt, os.path.join(CACHE_DIR, f"{cache_key}_v1.srt"))
         except Exception:
@@ -340,9 +365,8 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
         cleanup_temp(files_clean)
         return
 
-    # Ordem fixa no Stremio: v1=WEB, v2=HDTV, v3=BLURAY
+    # Ordem fixa: v1=WEB, v2=HDTV, v3=BLURAY
     priority_order = ["WEB", "HDTV", "BLURAY", "DEFAULT"]
-
     final_refs = []
     for p in priority_order:
         if p in refs_dict:
@@ -351,7 +375,7 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             break
 
     for i, (rtype, url) in enumerate(final_refs):
-        version_label = f"v{i+1}"  # v1, v2, v3
+        version_label = f"v{i+1}"
         final_path = os.path.join(CACHE_DIR, f"{cache_key}_{version_label}.srt")
         tmp_out = final_path + ".tmp"
 
@@ -370,7 +394,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
             if p.stderr:
                 logger.info(f"ffsubsync stderr ({version_label}): {p.stderr[-300:]}")
 
-            # write atômico
             os.replace(tmp_out, final_path)
 
         except subprocess.CalledProcessError as e:
@@ -378,7 +401,6 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
                 f"ffsubsync falhou ({version_label}) rc={e.returncode} "
                 f"stderr={e.stderr[-500:] if e.stderr else ''}"
             )
-            # limpa tmp se ficou
             try:
                 if os.path.exists(tmp_out):
                     os.remove(tmp_out)
@@ -403,7 +425,9 @@ def run_sync_thread(imdb_id, season, episode, cache_key):
     cleanup_temp(files_clean)
     logger.info(f"Concluído {cache_key}")
 
-# --- Rotas ---
+# =========================
+# Rotas
+# =========================
 
 @app.route("/")
 def index():
@@ -422,15 +446,18 @@ def subtitles(type, id, extra):
 
     cache_key = get_file_hash(imdb_id, season, episode)
 
-    # Placeholder imediato (evita timeout)
+    # placeholder imediato
     ensure_placeholders(cache_key)
 
-    # dispara processamento async
-    threading.Thread(target=run_sync_thread, args=(imdb_id, season, episode, cache_key), daemon=True).start()
+    # dispara async
+    threading.Thread(
+        target=run_sync_thread,
+        args=(imdb_id, season, episode, cache_key),
+        daemon=True
+    ).start()
 
     host = request.host_url.rstrip("/")
 
-    # Retorna 3 opções fixas (v1,v2,v3)
     return jsonify({
         "subtitles": [
             {"id": f"as_v1_{cache_key}", "url": f"{host}/static_subs/{cache_key}_v1.srt", "lang": "pob", "format": "srt"},
@@ -443,15 +470,13 @@ def subtitles(type, id, extra):
 def serve_subs(filename):
     file_path = os.path.join(CACHE_DIR, filename)
 
-    # Identifica versão para mensagem
     variant = "WEB-DL" if "_v1" in filename else "HDTV" if "_v2" in filename else "BluRay"
 
-    # Agora deve existir placeholder; mas mantemos retry curto.
+    # placeholder deve existir, mas deixa retry curto
     max_retries = 5
     for _ in range(max_retries):
         if os.path.exists(file_path):
             response = make_response(send_from_directory(CACHE_DIR, filename))
-            # cache agressivo só se NÃO for placeholder? Aqui mantemos simples:
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             return response
         time.sleep(1)
