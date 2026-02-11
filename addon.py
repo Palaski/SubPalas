@@ -81,108 +81,81 @@ def get_download_link(file_id, headers):
     except:
         return None
 
+
 def search_references_opensubtitles(imdb_id, season=None, episode=None):
     """
     Busca 3 referências distintas: WEB, HDTV e BLURAY.
     """
-    if not OS_API_KEY: return {}
-        
-     headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
+    if not OS_API_KEY:
+        return {}
 
-    try: clean_id = int(imdb_id.replace("tt", ""))
-
-    except: return {}
-
-
-
-    params = {"imdb_id": clean_id, "languages": "en", "order_by": "download_count", "order_direction": "desc"}
-
-    if season: params.update({"season_number": season, "episode_number": episode})
-
-
-
-    references = {} # Usar dict para garantir unicidade de tipo: {'WEB': url, 'HDTV': url, 'BLURAY': url}
-
-    
+    headers = {
+        "Api-Key": OS_API_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT
+    }
 
     try:
+        clean_id = int(imdb_id.replace("tt", ""))
+    except:
+        return {}
 
-        # Busca mais resultados para ter chance de achar BluRay
+    params = {
+        "imdb_id": clean_id,
+        "languages": "en",
+        "order_by": "download_count",
+        "order_direction": "desc"
+    }
 
-        res = requests.get("https://api.opensubtitles.com/api/v1/subtitles", headers=headers, params=params, timeout=12)
+    if season:
+        params.update({"season_number": season, "episode_number": episode})
 
+    # {'WEB': url, 'HDTV': url, 'BLURAY': url}
+    references = {}
+
+    try:
+        res = requests.get(
+            "https://api.opensubtitles.com/api/v1/subtitles",
+            headers=headers,
+            params=params,
+            timeout=12
+        )
         data = res.json()
 
-        
-
-        if data.get('total_count', 0) > 0:
-
-            results = data['data']
-
-            
+        if data.get("total_count", 0) > 0:
+            results = data["data"]
 
             for item in results:
+                if len(references) >= 3:
+                    break
 
-                # Se já preenchemos os 3 slots, para.
-
-                if len(references) >= 3: break
-
-                
-
-                f = item['attributes']['files'][0]
-
-                fname = f['file_name'].lower()
-
-                file_id = f['file_id']
-
-                
-
-                # Classificação por Nome
+                f = item["attributes"]["files"][0]
+                fname = f["file_name"].lower()
+                file_id = f["file_id"]
 
                 rtype = None
-
-                if any(x in fname for x in ['web', 'amzn', 'nf', 'hulu', 'netflix', 'disney']):
-
-                    rtype = 'WEB'
-
-                elif any(x in fname for x in ['bluray', 'bdrip', 'brrip', 'blue', 'bdr']):
-
-                    rtype = 'BLURAY'
-
-                elif any(x in fname for x in ['hdtv', 'tv', 'pdtv', 'dsr']):
-
-                    rtype = 'HDTV'
-
-                
-
-                # Se achou um tipo e ainda não temos esse tipo salvo
+                if any(x in fname for x in ["web", "amzn", "nf", "hulu", "netflix", "disney"]):
+                    rtype = "WEB"
+                elif any(x in fname for x in ["bluray", "bdrip", "brrip", "blue", "bdr"]):
+                    rtype = "BLURAY"
+                elif any(x in fname for x in ["hdtv", "tv", "pdtv", "dsr"]):
+                    rtype = "HDTV"
 
                 if rtype and rtype not in references:
-
                     link = get_download_link(file_id, headers)
+                    if link:
+                        references[rtype] = link
 
-                    if link: references[rtype] = link
-
-            
-
-            # Fallback: Se faltou algum slot, preenche com o top download genérico (se não for repetido)
-
-            if not references and len(results) > 0:
-
-                 link = get_download_link(results[0]['attributes']['files'][0]['file_id'], headers)
-
-                 if link: references['DEFAULT'] = link
-
-
+            # Fallback: se não achou nada classificado, pega o top genérico
+            if not references and results:
+                link = get_download_link(results[0]["attributes"]["files"][0]["file_id"], headers)
+                if link:
+                    references["DEFAULT"] = link
 
     except Exception as e:
-
         logger.error(f"Erro busca EN: {e}")
 
-    
-
     return references
-
 
 
 def search_best_ptbr(imdb_id, season=None, episode=None):
@@ -494,5 +467,6 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 7000))
 
     app.run(host='0.0.0.0', port=port)
+
 
 
