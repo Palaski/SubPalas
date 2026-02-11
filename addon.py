@@ -86,6 +86,7 @@ def search_references_opensubtitles(imdb_id, season=None, episode=None):
     Busca 3 referências distintas: WEB, HDTV e BLURAY.
     """
     if not OS_API_KEY: return {}
+        
      headers = {"Api-Key": OS_API_KEY, "Content-Type": "application/json", "User-Agent": USER_AGENT}
 
     try: clean_id = int(imdb_id.replace("tt", ""))
@@ -493,4 +494,5 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 7000))
 
     app.run(host='0.0.0.0', port=port)
+
 
