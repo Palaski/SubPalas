@@ -1,7 +1,7 @@
-gunicorn
 google-generativeai==0.8.3
 Flask==3.0.2
 flask-cors==4.0.0
 requests==2.32.3
 ffsubsync
 google-genai
+gunicorn==25.1.0
