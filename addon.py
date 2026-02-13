@@ -7,6 +7,7 @@ import threading
 import shutil
 import requests
 from typing import Optional, List, Dict, Tuple
+from urllib.parse import urlparse
 from flask import Flask, jsonify, request, send_from_directory, make_response
 from flask_cors import CORS
 
@@ -17,7 +18,8 @@ from flask_cors import CORS
 #  - 1 legenda apenas (addon "comum")
 #  - Cache em disco
 #  - Thread para processamento assíncrono
-#  - OpenSubtitles com login/token (BearER) + backoff p/ 429
+#  - OpenSubtitles com login/token (Bearer) + backoff p/ 429
+#  - Logs extras + normalização de base_url
 # ============================================================
 
 # -------------------------
@@ -49,12 +51,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 # Identificação do app (NÃO use User-Agent de browser)
 USER_AGENT = os.getenv("APP_USER_AGENT", "SubpalasAddon v0.1.0").strip()
 
-# OpenSubtitles base
-OS_BASE_DEFAULT = os.getenv("OS_BASE_URL", "https://api.opensubtitles.com/api/v1").rstrip("/")
-# Se seu ambiente bloquear, teste:
-# OS_BASE_DEFAULT = "https://www.opensubtitles.com/api/v1"
+# OpenSubtitles base (default)
+OS_BASE_DEFAULT = os.getenv("OS_BASE_URL", "https://api.opensubtitles.com/api/v1").strip()
 
-# Gemini model via REST (pode mudar se quiser)
+# Gemini model via REST
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview").strip()
 
 # -------------------------
@@ -70,6 +70,44 @@ MANIFEST = {
     "resources": ["subtitles"],
     "idPrefixes": ["tt"],
 }
+
+# ============================================================
+# Helpers: URL normalization + safe logging
+# ============================================================
+
+def _safe_snippet(text: str, limit: int = 300) -> str:
+    if not text:
+        return ""
+    t = text.replace("\n", " ").replace("\r", " ")
+    return t[:limit]
+
+def normalize_os_base_url(raw: str) -> str:
+    """
+    Garante:
+    - tem scheme (https://)
+    - remove trailing slash
+    - se não tiver /api/v1, adiciona (pois endpoints /subtitles, /login, /download ficam ali)
+    """
+    s = (raw or "").strip()
+    if not s:
+        return "https://api.opensubtitles.com/api/v1"
+
+    # Se vier só "api.opensubtitles.com" sem scheme
+    if not s.startswith("http://") and not s.startswith("https://"):
+        s = "https://" + s
+
+    s = s.rstrip("/")
+
+    # Normaliza path
+    parsed = urlparse(s)
+    # Ex: https://api.opensubtitles.com   -> adiciona /api/v1
+    # Ex: https://api.opensubtitles.com/api/v1 -> mantém
+    # Ex: https://www.opensubtitles.com/api/v1 -> mantém
+    path = parsed.path or ""
+    if not path.endswith("/api/v1") and "/api/v1" not in path:
+        s = s + "/api/v1"
+
+    return s.rstrip("/")
 
 # ============================================================
 # Locks / Cache keys
@@ -118,7 +156,7 @@ def download_file(url: str, dest_path: str) -> bool:
                         f.write(chunk)
         return True
     except Exception as e:
-        logger.error(f"Download falhou: {e}")
+        logger.error(f"Download falhou: {e} url={url}")
         return False
 
 # ============================================================
@@ -126,9 +164,11 @@ def download_file(url: str, dest_path: str) -> bool:
 # ============================================================
 
 _os_token: Optional[str] = None
-_os_base_url: str = OS_BASE_DEFAULT
+_os_base_url: str = normalize_os_base_url(OS_BASE_DEFAULT)
 _os_token_ts: float = 0.0
 _os_token_lock = threading.Lock()
+
+logger.info(f"OpenSubtitles base_url inicial: {_os_base_url} (OS_BASE_URL env={OS_BASE_DEFAULT})")
 
 def os_headers(with_auth: bool = True) -> Dict[str, str]:
     h = {
@@ -142,7 +182,6 @@ def os_headers(with_auth: bool = True) -> Dict[str, str]:
     return h
 
 def _sleep_backoff(resp: requests.Response, attempt: int) -> None:
-    # Respeita Retry-After se vier, senão backoff progressivo.
     try:
         ra = resp.headers.get("Retry-After")
         if ra:
@@ -155,8 +194,8 @@ def _sleep_backoff(resp: requests.Response, attempt: int) -> None:
 
 def os_login(force: bool = False) -> bool:
     """
-    Faz login e pega token. Em alguns casos o login pode retornar base_url.
-    Evita logar sempre (rate limit).
+    Faz login e pega token.
+    Alguns fluxos retornam base_url. Vamos normalizar pra nunca quebrar URL.
     """
     global _os_token, _os_base_url, _os_token_ts
 
@@ -166,47 +205,52 @@ def os_login(force: bool = False) -> bool:
 
     with _os_token_lock:
         if _os_token and not force:
-            # token já existe; você pode adicionar TTL aqui se quiser renovar periodicamente.
             return True
 
         url = f"{_os_base_url}/login"
         payload = {"username": OS_USERNAME, "password": OS_PASSWORD}
 
         for attempt in range(5):
+            req_id = f"login#{attempt}"
+            r: Optional[requests.Response] = None
+
             try:
+                logger.info(f"[{req_id}] POST {url} (base={_os_base_url})")
                 r = requests.post(url, headers=os_headers(with_auth=False), json=payload, timeout=20)
 
                 if r.status_code == 429:
-                    logger.warning("OpenSubtitles /login 429 (rate limit). Backoff...")
+                    logger.warning(f"[{req_id}] /login 429 (rate limit). retry-after={r.headers.get('Retry-After')}")
                     _sleep_backoff(r, attempt)
                     continue
 
+                if r.status_code >= 400:
+                    logger.error(f"[{req_id}] /login HTTP {r.status_code} body={_safe_snippet(r.text)}")
                 r.raise_for_status()
-                data = r.json()
 
+                data = r.json()
                 token = data.get("token")
                 if not token:
-                    logger.error(f"OpenSubtitles /login sem token. body={str(data)[:300]}")
+                    logger.error(f"[{req_id}] /login sem token. body={_safe_snippet(json.dumps(data))}")
                     return False
 
                 _os_token = token
                 _os_token_ts = time.time()
 
-                # Alguns fluxos devolvem base_url (ex: vip-api). Use se existir.
                 base_url = data.get("base_url")
                 if base_url:
-                    _os_base_url = base_url.rstrip("/")
-                    logger.info(f"OpenSubtitles base_url atualizado para: {_os_base_url}")
+                    normalized = normalize_os_base_url(base_url)
+                    if normalized != _os_base_url:
+                        logger.info(f"[{req_id}] base_url recebido={base_url} -> normalizado={normalized}")
+                    _os_base_url = normalized
 
+                logger.info(f"[{req_id}] Login OK. base={_os_base_url}")
                 return True
 
             except Exception as e:
                 body = ""
-                try:
-                    body = r.text[:300]  # type: ignore
-                except Exception:
-                    pass
-                logger.error(f"OpenSubtitles /login falhou: {e} body={body}")
+                if r is not None:
+                    body = _safe_snippet(r.text)
+                logger.error(f"[{req_id}] OpenSubtitles /login falhou: {e} body={body}")
                 time.sleep(min(10, 1 + attempt * 2))
 
         return False
@@ -214,43 +258,53 @@ def os_login(force: bool = False) -> bool:
 def os_get_with_retry(path: str, params: Dict, tries: int = 6) -> Optional[requests.Response]:
     """
     GET com retry p/ 401 (relogin) e 429 (backoff).
+    Logs extras: url final, params, status, snippet body em erro.
     """
     if not OS_API_KEY:
+        logger.error("OpenSubtitles: OS_API_KEY vazio.")
         return None
 
-    # garante token
     if not _os_token:
         if not os_login():
             return None
 
+    # garante base_url sempre normalizado (caso alguma coisa tenha sobrescrito)
+    global _os_base_url
+    _os_base_url = normalize_os_base_url(_os_base_url)
+
     url = f"{_os_base_url}{path}"
 
     for attempt in range(tries):
+        req_id = f"GET{path}#{attempt}"
+        r: Optional[requests.Response] = None
+
         try:
+            logger.info(f"[{req_id}] GET {url} params={params}")
             r = requests.get(url, headers=os_headers(with_auth=True), params=params, timeout=25)
 
             if r.status_code == 401:
-                # token inválido/expirado -> relogin e tenta de novo
-                logger.warning("OpenSubtitles GET 401. Re-login...")
+                logger.warning(f"[{req_id}] 401 -> relogin e retry. body={_safe_snippet(r.text)}")
                 if not os_login(force=True):
                     return None
                 continue
 
             if r.status_code == 429:
-                logger.warning("OpenSubtitles GET 429 (rate limit). Backoff...")
+                logger.warning(f"[{req_id}] 429 rate limit. retry-after={r.headers.get('Retry-After')}")
                 _sleep_backoff(r, attempt)
                 continue
 
+            if r.status_code >= 400:
+                logger.error(f"[{req_id}] HTTP {r.status_code} body={_safe_snippet(r.text)}")
             r.raise_for_status()
             return r
 
         except Exception as e:
             body = ""
-            try:
-                body = r.text[:300]  # type: ignore
-            except Exception:
-                pass
-            logger.error(f"OpenSubtitles GET falhou: {e} body={body}")
+            status = None
+            if r is not None:
+                status = r.status_code
+                body = _safe_snippet(r.text)
+            logger.error(f"[{req_id}] OpenSubtitles GET falhou: {e} status={status} url={url} body={body}")
             time.sleep(min(10, 1 + attempt * 2))
 
     return None
@@ -258,67 +312,79 @@ def os_get_with_retry(path: str, params: Dict, tries: int = 6) -> Optional[reque
 def os_post_with_retry(path: str, payload: Dict, tries: int = 6) -> Optional[requests.Response]:
     """
     POST com retry p/ 401 (relogin) e 429 (backoff).
+    Logs extras: url final, status, snippet body em erro.
     """
     if not OS_API_KEY:
+        logger.error("OpenSubtitles: OS_API_KEY vazio.")
         return None
 
     if not _os_token:
         if not os_login():
             return None
 
+    global _os_base_url
+    _os_base_url = normalize_os_base_url(_os_base_url)
+
     url = f"{_os_base_url}{path}"
 
     for attempt in range(tries):
+        req_id = f"POST{path}#{attempt}"
+        r: Optional[requests.Response] = None
+
         try:
+            logger.info(f"[{req_id}] POST {url}")
             r = requests.post(url, headers=os_headers(with_auth=True), json=payload, timeout=25)
 
             if r.status_code == 401:
-                logger.warning("OpenSubtitles POST 401. Re-login...")
+                logger.warning(f"[{req_id}] 401 -> relogin e retry. body={_safe_snippet(r.text)}")
                 if not os_login(force=True):
                     return None
                 continue
 
             if r.status_code == 429:
-                logger.warning("OpenSubtitles POST 429 (rate limit). Backoff...")
+                logger.warning(f"[{req_id}] 429 rate limit. retry-after={r.headers.get('Retry-After')}")
                 _sleep_backoff(r, attempt)
                 continue
 
+            if r.status_code >= 400:
+                logger.error(f"[{req_id}] HTTP {r.status_code} body={_safe_snippet(r.text)}")
             r.raise_for_status()
             return r
 
         except Exception as e:
             body = ""
-            try:
-                body = r.text[:300]  # type: ignore
-            except Exception:
-                pass
-            logger.error(f"OpenSubtitles POST falhou: {e} body={body}")
+            status = None
+            if r is not None:
+                status = r.status_code
+                body = _safe_snippet(r.text)
+            logger.error(f"[{req_id}] OpenSubtitles POST falhou: {e} status={status} url={url} body={body}")
             time.sleep(min(10, 1 + attempt * 2))
 
     return None
 
 def os_get_download_link(file_id: int) -> Optional[str]:
-    """
-    /download: precisa Bearer token.
-    """
     r = os_post_with_retry("/download", {"file_id": file_id})
     if not r:
         return None
     try:
         data = r.json()
-        return data.get("link")
+        link = data.get("link")
+        if not link:
+            logger.error(f"OpenSubtitles /download sem link. body={_safe_snippet(r.text)}")
+        return link
     except Exception:
-        logger.error(f"OpenSubtitles /download: resposta inválida: {r.text[:300]}")
+        logger.error(f"OpenSubtitles /download: resposta inválida: {_safe_snippet(r.text)}")
         return None
 
 def os_search_best_download_link(imdb_id: str, lang: str, season: Optional[int], episode: Optional[int]) -> Optional[str]:
     """
     Busca a mais baixada no idioma e retorna link de download.
-    lang: "pt-br" ou "en" etc.
+    lang: "pt-br" ou "en"
     """
     try:
         clean_id = int(imdb_id.replace("tt", ""))
     except Exception:
+        logger.error(f"imdb_id inválido: {imdb_id}")
         return None
 
     params = {
@@ -336,7 +402,10 @@ def os_search_best_download_link(imdb_id: str, lang: str, season: Optional[int],
 
     try:
         data = r.json()
-        if data.get("total_count", 0) <= 0:
+        total = data.get("total_count", 0)
+        logger.info(f"OpenSubtitles /subtitles lang={lang} total_count={total}")
+
+        if total <= 0:
             return None
 
         first = data["data"][0]
@@ -345,7 +414,7 @@ def os_search_best_download_link(imdb_id: str, lang: str, season: Optional[int],
         return os_get_download_link(file_id)
 
     except Exception:
-        logger.error(f"OpenSubtitles /subtitles: JSON inesperado: {r.text[:400]}")
+        logger.error(f"OpenSubtitles /subtitles: JSON inesperado: {_safe_snippet(r.text, 400)}")
         return None
 
 # ============================================================
@@ -382,12 +451,10 @@ def gemini_translate_lines_rest(lines: List[str], target_lang: str = "pt-BR") ->
     try:
         text = data["candidates"][0]["content"]["parts"][0].get("text", "")
     except Exception:
-        # pode vir bloqueado/sem candidato
-        raise RuntimeError(f"Resposta Gemini inesperada: {json.dumps(data)[:500]}")
+        raise RuntimeError(f"Resposta Gemini inesperada: {_safe_snippet(json.dumps(data), 500)}")
 
     out_lines = (text or "").strip().splitlines()
 
-    # Ajuste defensivo
     if len(out_lines) != len(lines):
         logger.warning(f"Gemini retornou {len(out_lines)} linhas, esperado {len(lines)}. Ajustando.")
         if len(out_lines) < len(lines):
@@ -437,7 +504,6 @@ def translate_srt_via_gemini(srt_text: str) -> str:
     if not all_lines:
         return srt_text
 
-    # Batch conservador
     BATCH = 50
     translated: List[str] = [""] * len(all_lines)
 
@@ -463,7 +529,7 @@ def build_subtitle(cache_key: str, imdb_id: str, season: Optional[int], episode:
         if os.path.exists(final_path):
             return
 
-        logger.info(f"Gerando legenda para {cache_key}...")
+        logger.info(f"Gerando legenda para {cache_key} (imdb={imdb_id} season={season} ep={episode})")
 
         tmp_files: List[str] = []
 
@@ -530,7 +596,6 @@ def subtitles(type, id, extra):
 
     cache_key = get_cache_key(imdb_id, season, episode)
 
-    # dispara processamento em background
     threading.Thread(
         target=build_subtitle,
         args=(cache_key, imdb_id, season, episode),
@@ -553,7 +618,6 @@ def subtitles(type, id, extra):
 def serve_subs(filename):
     file_path = os.path.join(CACHE_DIR, filename)
 
-    # aguarda até 25s o job terminar
     for _ in range(25):
         if os.path.exists(file_path):
             response = make_response(send_from_directory(CACHE_DIR, filename))
