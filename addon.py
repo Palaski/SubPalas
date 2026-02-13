@@ -27,7 +27,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 OS_API_KEY = os.getenv("OS_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+USER_AGENT = "SubpalasAddon v0.1.0"
 
 MANIFEST = {
     "id": "community.subs.ptbr.simple",
@@ -93,6 +93,7 @@ def os_headers():
         "Api-Key": OS_API_KEY,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
+        "X-User-Agent": USER_AGENT,
     }
 
 def get_download_link(file_id):
@@ -356,3 +357,4 @@ def serve_subs(filename):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7000))
     app.run(host="0.0.0.0", port=port)
+
